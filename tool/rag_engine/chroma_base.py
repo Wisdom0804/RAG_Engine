@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 文件名：chroma_base.py
-文件描述: 
+文件描述: 向量数据库操作基类，仅提供基础的增删改查（CRUD）
 作者: 郑智文
 创建日期: 2026/9/5 10:04
 版本: 1.0
@@ -9,121 +9,135 @@ IDE: PyCharm
 
 Copyright (c) 2026 星际区块链（深圳）有限公司. All rights reserved.
 """
+import asyncio
 from uuid import uuid4
 
-import asyncio
-from sentence_transformers import SentenceTransformer, CrossEncoder
-from chromadb.utils import embedding_functions
-# 使用相对路径，防止模块移动
-from . import chromadb_client
-# 配置文件路径，根据具体项目结构调整
-from app.config.security import secure
+from tool.rag_engine import chromadb_client
+from tool.rag_engine.Schemas.chroma_schemas import ChromaGetResponse
 
 
 class ChromaBase:
     """
-    向量数据库操作基类，单例模式，提供基础的CRUD
+    向量数据库操作基类，提供基础的 CRUD。
+
+    阻塞的 ChromaDB 调用通过 asyncio.to_thread 丢到线程池，避免阻塞事件循环。
+    嵌入向量由调用方外部计算后传入，本类不负责 embedding / rerank。
     """
 
     def __init__(self, collection_name: str = 'learning'):
-        """
-        磁盘持久化存储，单例模式不需要连接池
-        """
-        # 取消嵌入模型的设置，外部自行计算
-        # embedding_function = embedding_functions.OpenAIEmbeddingFunction(
-        #     api_key=secure.QWEN_API_KEY,
-        #     model_name=secure.EMBEDDING_NAME,
-        #     api_base=secure.QWEN_API_BASE,
-        # )
-        # 默认嵌入模型
-        self.embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
-        # 默认重排模型
-        self.cross_encoder = CrossEncoder("cross-encoder/ms-marco-MiniLM-L6-v2")
-        # 集合
-        self.collection = chromadb_client.get_or_create_collection(name=collection_name,
-                                                                   # embedding_function=embedding_function
-                                                                   )
+        self.collection = chromadb_client.get_or_create_collection(name=collection_name)
 
-    async def embed_chunk(self, chunk: str) -> list[float]:
+    async def add(self, documents: list[str] | None = None,
+                  embeddings: list[list[float]] | None = None,
+                  metadatas: list[dict] | None = None,
+                  ids: list[str] | None = None) -> list[str]:
         """
-        向量化切片
+        新增数据（Create）。documents / embeddings / metadatas 任选传入，
+        同时传入多个时长度必须一致。未传 ids 时自动生成 UUID。
+        :return: 写入的 ids 列表
         """
-        embedding = self.embedding_model.encode(chunk)
-        return embedding.tolist()
+        lengths = [len(x) for x in (documents, embeddings, metadatas, ids) if x is not None]
+        if not lengths:
+            raise ValueError("documents、embeddings、metadatas 至少需要传入一个")
+        if len(set(lengths)) > 1:
+            raise ValueError("documents、embeddings、metadatas、ids 同时传入时长度必须一致")
 
-    async def add(self, chunks: list[str] | None = None, embeddings: list[str] | None = None,
-                  metadatas: list[dict] | None = None):
-        """
-        添加
-        """
-        param_info = []
-        chunk_len = len(chunks) if chunks else 0
-        embedding_len = len(embeddings) if embeddings else 0
-        metadata_len = len(metadatas) if metadatas else 0
+        count = lengths[0]
+        if ids is None:
+            ids = [str(uuid4()) for _ in range(count)]
 
-        if chunks is not None:
-            param_info.append(("chunks", chunk_len))
+        data = {"ids": ids}
+        if documents is not None:
+            data["documents"] = documents
         if embeddings is not None:
-            param_info.append(("embeddings", embedding_len))
+            data["embeddings"] = embeddings
         if metadatas is not None:
-            param_info.append(("metadatas", metadata_len))
+            data["metadatas"] = metadatas
 
-        # 只要有至少一个传入参数，全部长度必须相等
-        if len(param_info) > 1:
-            first_name, first_len = param_info[0]
-            for name, length in param_info[1:]:
-                if length != first_len:
-                    raise ValueError(
-                        f"参数长度不匹配：{first_name}长度={first_len}，{name}长度={length}。"
-                        "chunks、embeddings、metadatas 同时传入任意两个或全部时，数组长度必须保持一致"
-                    )
+        await asyncio.to_thread(self.collection.add, **data)
+        return ids
 
-        data_from = dict()
-
-        if chunk_len:
-            data_from["documents"] = chunks
-        if embedding_len:
-            data_from["embeddings"] = embeddings
-        if metadata_len:
-            data_from["metadatas"] = metadatas
-
-        ids = [str(uuid4()) for _ in range(max(chunk_len, embedding_len, metadata_len))]
-        data_from["ids"] = ids
-
-        self.collection.add(**data_from)
-
-    async def retrieve(self, query: str, top_k: int) -> list[str]:
+    async def get(self, **filters) -> ChromaGetResponse:
         """
-        检索
+        查询数据（Read）。默认排除 embeddings，无筛选条件时返回全量数据。
+        筛选项透传 ChromaDB，常用键：ids / where / limit / offset / where_document / include。
+        offset从0开始。
+        :return: 仅含 ids、documents、embeddings、metadatas 四个字段的响应
         """
-        query_embedding = await self.embed_chunk(query)
-        res = self.collection.query(
-            query_embeddings=[query_embedding],
-            n_results=top_k
+        filters.setdefault("include", ["metadatas", "documents"])
+        res = await asyncio.to_thread(self.collection.get, **filters)
+        return ChromaGetResponse(
+            ids=res["ids"],
+            documents=res.get("documents"),
+            embeddings=res.get("embeddings"),
+            metadatas=res.get("metadatas"),
         )
-        return res['documents'][0]
 
-    async def rerank(self, query: str, retrieved_chunks: list[str], top_k: int) -> list[str]:
+    async def query(self, query_embeddings: list[list[float]], n_results: int,
+                    where: dict | None = None) -> list[str]:
         """
-        重排函数
+        按向量相似检索（Read）。嵌入向量由外部计算后传入。
+        :param where: 可选，按 metadata 筛选
+        :return: 命中的 documents 列表
         """
-        pairs = [
-            (query, chunk)
-            for chunk in retrieved_chunks
-        ]
-        scores = self.cross_encoder.predict(pairs)
-        chunk_with_score_list = [
-            (chunk, score)
-            for chunk, score in zip(retrieved_chunks, scores)
-        ]
-        chunk_with_score_list.sort(key=lambda pair: pair[1], reverse=True)
+        kwargs = {
+            "query_embeddings": query_embeddings,
+            "n_results": n_results,
+        }
+        if where is not None:
+            kwargs["where"] = where
+        res = await asyncio.to_thread(self.collection.query, **kwargs)
+        return res["documents"][0]
 
-        return [chunk for chunk, score in chunk_with_score_list[:top_k]]
+    async def update(self, ids: list[str],
+                     documents: list[str] | None = None,
+                     embeddings: list[list[float]] | None = None,
+                     metadatas: list[dict] | None = None):
+        """
+        更新数据（Update）。ids 必传，documents / embeddings / metadatas 至少传一个。
+        """
+        if documents is None and embeddings is None and metadatas is None:
+            raise ValueError("documents、embeddings、metadatas 至少需要传入一个")
+        data = {"ids": ids}
+        if documents is not None:
+            data["documents"] = documents
+        if embeddings is not None:
+            data["embeddings"] = embeddings
+        if metadatas is not None:
+            data["metadatas"] = metadatas
+        await asyncio.to_thread(self.collection.update, **data)
+
+    async def delete(self, ids: list[str]):
+        """
+        按 ID 删除（Delete）。
+        """
+        await asyncio.to_thread(self.collection.delete, ids=ids)
 
 
 if __name__ == '__main__':
-    chroma = ChromaBase()
-    asyncio.run(chroma.add(chunks=['Hello', '扣你吉瓦', 'ohhhhhhh']))
-    # asyncio.run(chroma.retrieve('你好',2))
-    res = asyncio.run(chroma.rerank('你好', ['Hello', '扣你吉瓦', 'ohhhhhhh'], 2))
-    print(res)
+    async def main():
+        db = ChromaBase()
+        # Create
+        ids = await db.add(documents=['Hello', '扣你吉瓦', 'ohhhhhhh'],
+                           metadatas=[{'src': 'a'}, {'src': 'b'}, {'src': 'a'}])
+        print('added:', ids)
+        # Read - 全量查询
+        print('get all:', await db.get())
+        # Read - 按 ID 筛选
+        print('get by ids:', await db.get(ids=ids[:1]))
+        # Read - 按 metadata 筛选
+        print('get by where:', await db.get(where={'src': 'a'}))
+        # Read - 按文档内容筛选
+        print('get by where_document:', await db.get(where_document={'$contains': 'Hello'}))
+        # Read - limit + offset 分页
+        print('get with limit/offset:', await db.get(limit=3, offset=1))
+        # Update
+        await db.update(ids=ids[:1], documents=['Hello Updated'])
+        print('after update:', await db.get(ids=ids[:1]))
+        # Delete
+        await db.delete(ids[:1])
+        print('after delete:', await db.get(ids=ids))
+        # Read - limit + offset 分页
+        print('get with limit/offset:', await db.get(limit=10, offset=0))
+
+    asyncio.run(main())
