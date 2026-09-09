@@ -42,7 +42,8 @@ class FixedLengthChunking(ChunkingStrategy):
     """
     定长切分策略
     按固定长度对文本进行切分，不考虑语义完整性
-    overlap 为 chunk_size 的百分比（overlap=10 表示重叠 chunk_size 的 10%）
+    overlap 为相邻分块共享的绝对字符数（overlap=10 表示相邻分块重叠 10 个字符），
+    overlap 取自前一分块尾部，从 chunk_size 内部扣除，保证每个分块长度不超过 chunk_size
     """
 
     def __init__(self, chunk_size: int = 200, overlap: int = 0):
@@ -79,10 +80,14 @@ class FixedLengthChunking(ChunkingStrategy):
         chunks = []
         start = 0
         text_len = len(text)
+        # 步长 = chunk_size - overlap，保证相邻分块共享 overlap 个字符且每片不超限
+        step = self.chunk_size - self.overlap
         while start < text_len:
-            end = start + self.chunk_size + self.overlap
+            end = start + self.chunk_size
             chunks.append(text[start:end])
-            start = end - self.overlap
+            if end >= text_len:
+                break
+            start += step
         return chunks
 
 
@@ -441,7 +446,7 @@ class StructuralChunking(ChunkingStrategy):
         def flush_content():
             if content_lines:
                 path = ' > '.join(title_stack)
-                units.append({'path': path, 'content': '\n'.join(content_lines)})
+                units.append({'path': path, 'content': '\n'.join(content_lines).rstrip('\n')})
                 content_lines.clear()
 
         for line in text.split('\n'):
@@ -471,6 +476,7 @@ class StructuralChunking(ChunkingStrategy):
         识别代码结构单元：函数/类/方法定义作为分界，块内为正文。
         以缩进推断层级：同级缩进的定义为兄弟（平铺），更深缩进为子定义。
         兼容 Python(def/class)、JS/TS(function/class/export) 等常见定义。
+        def/class 行与其后续函数体行合并为同一结构单元，避免签名与实现被拆开。
         """
         units = []
         title_stack = []  # [(indent, name), ...]
@@ -497,7 +503,8 @@ class StructuralChunking(ChunkingStrategy):
                 while title_stack and title_stack[-1][0] >= indent:
                     title_stack.pop()
                 title_stack.append((indent, name))
-                units.append({'path': ' > '.join(n for _, n in title_stack), 'content': line})
+                # def/class 行作为新单元的第一行，函数体后续累积到同一单元
+                current_lines.append(line)
             else:
                 current_lines.append(line)
         flush_content()
@@ -536,18 +543,33 @@ class StructuralChunking(ChunkingStrategy):
                 else:
                     if current.strip():
                         chunks.append(current)
-                    # overlap 衔接
-                    if self.overlap > 0 and chunks:
+                    # overlap 衔接（代码切分禁用 char-level overlap）
+                    # overlap 取前一片尾部，置于 prefix 之后、content 之前，保证路径前缀始终在 chunk 头部
+                    if self.overlap > 0 and self.doc_type != 'code' and chunks:
                         tail = chunks[-1][-self.overlap:]
-                        if len(tail) + len(piece) <= self.chunk_size:
-                            current = tail + piece
+                        overlap_piece = prefix + tail + content
+                        if len(overlap_piece) <= self.chunk_size:
+                            current = overlap_piece
                         else:
                             current = piece
                     else:
                         current = piece
             else:
                 # 单个结构单元超长，在结构内递归切分
-                sub_chunks = self._recursive.split(content)
+                # 递归切分目标需扣除 prefix 长度，避免拼接后超限
+                # 代码切分例外：目标不减 prefix，保证代码行完整，避免在子句边界拆碎语句
+                # 递归切分内部关闭 overlap，避免字符级片段破坏代码/句子结构；chunk 间 overlap 由 _build_chunks 统一处理
+                if self.doc_type == 'code':
+                    target_size = self.chunk_size
+                else:
+                    target_size = max(1, self.chunk_size - len(prefix))
+                saved_size = self._recursive.chunk_size
+                saved_overlap = self._recursive.overlap
+                self._recursive.configure(chunk_size=target_size, overlap=0)
+                try:
+                    sub_chunks = self._recursive.split(content)
+                finally:
+                    self._recursive.configure(chunk_size=saved_size, overlap=saved_overlap)
                 for sc in sub_chunks:
                     sc_piece = prefix + sc
                     if len(current) + len(sc_piece) + (1 if current else 0) <= self.chunk_size:
@@ -555,10 +577,13 @@ class StructuralChunking(ChunkingStrategy):
                     else:
                         if current.strip():
                             chunks.append(current)
-                        if self.overlap > 0 and chunks:
+                        # 代码切分禁用 char-level overlap，避免拆碎语句；其余类型保留 overlap 衔接
+                        # overlap 置于 prefix 之后、sc 之前，保证路径前缀始终在 chunk 头部
+                        if self.overlap > 0 and self.doc_type != 'code' and chunks:
                             tail = chunks[-1][-self.overlap:]
-                            if len(tail) + len(sc_piece) <= self.chunk_size:
-                                current = tail + sc_piece
+                            overlap_piece = prefix + tail + sc
+                            if len(overlap_piece) <= self.chunk_size:
+                                current = overlap_piece
                             else:
                                 current = sc_piece
                         else:
