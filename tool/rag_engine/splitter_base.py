@@ -663,7 +663,7 @@ class TextSplitter:
         self.strategy = None
         self.set_strategy(name, **kwargs)
 
-    def set_strategy(self, name: str, **kwargs) -> None:
+    def set_strategy(self, name: str = None, **kwargs) -> None:
         """
         切换或初始化分块策略
         缓存命中则复用已有策略实例（并按 kwargs 原地 configure），
@@ -678,9 +678,11 @@ class TextSplitter:
             self.strategy = self._cache[key]
             if kwargs:
                 self.strategy.configure(**kwargs)
+            return None
         else:
             self.strategy = SplitterFactory.create_strategy(name, **kwargs)
             self._cache[key] = self.strategy
+            return None
 
     def split(self, text: str) -> list[str]:
         """委托当前策略执行切分"""
