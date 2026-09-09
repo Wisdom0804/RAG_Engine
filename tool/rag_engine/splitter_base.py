@@ -11,21 +11,46 @@ Copyright (c) 2026 星际区块链（深圳）有限公司. All rights reserved.
 """
 import re
 from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from typing import Optional
+
 import numpy as np
 from sentence_transformers import SentenceTransformer
 
 from app.libs.enums import ChunkingStrategyEnum
+from tool.siem_tool.snow_flake import snow_flake
+
+
+@dataclass
+class Chunk:
+    """
+    切分结果统一数据结构
+    - document: chunk 文本
+    - metadata: 自定义元数据（chunk_id / parent_id / path 等）
+    - embedding: 嵌入向量，由下游嵌入步骤填充，split 阶段为 None
+    - parent: 所属父块 Chunk（内存对象引用，非重复存储）；顶层块为 None
+    """
+    document: str
+    metadata: dict = field(default_factory=dict)
+    embedding: Optional[list[float]] = None
+    parent: Optional['Chunk'] = None
+
+
+def _new_chunk(document: str, **metadata) -> Chunk:
+    """统一 Chunk 构造点：自动填充雪花 ID 作为 chunk_id"""
+    metadata['chunk_id'] = snow_flake.next_id()
+    return Chunk(document=document, metadata=metadata)
 
 
 class ChunkingStrategy(ABC):
     """分块策略抽象基类，所有具体切分策略均需实现 split 与 configure 方法"""
 
     @abstractmethod
-    def split(self, text: str) -> list[str]:
+    def split(self, text: str) -> list[Chunk]:
         """
-        切分文本，返回分块列表
+        切分文本，返回 Chunk 列表（带元数据）
         :param text: 待切分的文本
-        :return: 分块列表
+        :return: Chunk 列表
         """
         pass
 
@@ -74,7 +99,7 @@ class FixedLengthChunking(ChunkingStrategy):
             self.overlap = overlap
         self._validate()
 
-    def split(self, text: str) -> list[str]:
+    def split(self, text: str) -> list[Chunk]:
         if not text:
             return []
         chunks = []
@@ -84,7 +109,7 @@ class FixedLengthChunking(ChunkingStrategy):
         step = self.chunk_size - self.overlap
         while start < text_len:
             end = start + self.chunk_size
-            chunks.append(text[start:end])
+            chunks.append(_new_chunk(text[start:end]))
             if end >= text_len:
                 break
             start += step
@@ -174,13 +199,13 @@ class SemanticChunking(ChunkingStrategy):
             chunks.append(current)
         return chunks
 
-    def split(self, text: str) -> list[str]:
+    def split(self, text: str) -> list[Chunk]:
         if not text:
             return []
         # 切分
         sentences = self._split_sentences(text)
         if len(sentences) <= 1:
-            return [text] if text.strip() else []
+            return [_new_chunk(text)] if text.strip() else []
 
         # 批量计算所有句子的嵌入向量
         embeddings = self.embed_fn.encode(sentences)
@@ -198,13 +223,11 @@ class SemanticChunking(ChunkingStrategy):
         if current:
             chunks.append(''.join(current))
 
-        # 限制最大分片大小，防止语义连贯产生超大分片
-        result = []
+        # 限制最大分片大小，防止语义连贯产生超大分片；统一包装为 Chunk
+        result: list[Chunk] = []
         for chunk in chunks:
-            if len(chunk) > self.max_chunk_size:
-                result.extend(self._split_oversized(chunk))
-            else:
-                result.append(chunk)
+            pieces = self._split_oversized(chunk) if len(chunk) > self.max_chunk_size else [chunk]
+            result.extend(_new_chunk(p) for p in pieces)
         return result
 
 
@@ -320,11 +343,11 @@ class RecursiveChunking(ChunkingStrategy):
             merged.append(current)
         return merged
 
-    def split(self, text: str) -> list[str]:
+    def split(self, text: str) -> list[Chunk]:
         if not text:
             return []
         small_chunks = self._recursive_split(text)
-        return self._merge_chunks(small_chunks)
+        return [_new_chunk(c) for c in self._merge_chunks(small_chunks)]
 
 
 class StructuralChunking(ChunkingStrategy):
@@ -512,16 +535,19 @@ class StructuralChunking(ChunkingStrategy):
 
     # ---------- chunk 组装 ----------
 
-    def _build_chunks(self, units: list[dict]) -> list[str]:
+    def _build_chunks(self, units: list[dict]) -> list[Chunk]:
         """
         在结构内部递归切分并组装 chunk：
-        - 在 chunk 头部保留标题路径元数据 [path]
+        - 在 chunk 头部保留标题路径元数据 [path]，并写入 metadata['path']
         - 单个结构单元超长时用 RecursiveChunking 在结构内继续切分
         - 相邻分块保留 overlap（取自前一 chunk 的正文尾部）
         """
-        chunks = []
+        chunks: list[Chunk] = []
         current = ''
-        current_path = None
+        # content_path 表示 current 中已累积内容的所属路径，随 current 的整体赋值同步更新
+        content_path = None
+        # 前一已收尾 chunk 的正文尾部，用于 overlap 衔接
+        prev_tail = ''
 
         for unit in units:
             path = unit['path']
@@ -530,8 +556,9 @@ class StructuralChunking(ChunkingStrategy):
                 continue
 
             # 标题路径变化时，若当前分块非空则收尾
-            if path and path != current_path and current.strip():
-                chunks.append(current)
+            if path and path != content_path and current.strip():
+                chunks.append(_new_chunk(current, path=content_path))
+                prev_tail = current[-self.overlap:] if self.overlap > 0 else ''
                 current = ''
 
             prefix = f"[{path}]\n" if path else ''
@@ -539,26 +566,28 @@ class StructuralChunking(ChunkingStrategy):
 
             if len(piece) <= self.chunk_size:
                 if len(current) + len(piece) + (1 if current else 0) <= self.chunk_size:
-                    current = current + '\n' + piece if current else piece
+                    if current:
+                        current = current + '\n' + piece
+                    else:
+                        current = piece
+                        content_path = path
                 else:
                     if current.strip():
-                        chunks.append(current)
+                        chunks.append(_new_chunk(current, path=content_path))
+                        prev_tail = current[-self.overlap:] if self.overlap > 0 else ''
                     # overlap 衔接（代码切分禁用 char-level overlap）
                     # overlap 取前一片尾部，置于 prefix 之后、content 之前，保证路径前缀始终在 chunk 头部
-                    if self.overlap > 0 and self.doc_type != 'code' and chunks:
-                        tail = chunks[-1][-self.overlap:]
-                        overlap_piece = prefix + tail + content
+                    if self.overlap > 0 and self.doc_type != 'code' and prev_tail:
+                        overlap_piece = prefix + prev_tail + content
                         if len(overlap_piece) <= self.chunk_size:
                             current = overlap_piece
                         else:
                             current = piece
                     else:
                         current = piece
+                    content_path = path
             else:
                 # 单个结构单元超长，在结构内递归切分
-                # 递归切分目标需扣除 prefix 长度，避免拼接后超限
-                # 代码切分例外：目标不减 prefix，保证代码行完整，避免在子句边界拆碎语句
-                # 递归切分内部关闭 overlap，避免字符级片段破坏代码/句子结构；chunk 间 overlap 由 _build_chunks 统一处理
                 if self.doc_type == 'code':
                     target_size = self.chunk_size
                 else:
@@ -571,30 +600,33 @@ class StructuralChunking(ChunkingStrategy):
                 finally:
                     self._recursive.configure(chunk_size=saved_size, overlap=saved_overlap)
                 for sc in sub_chunks:
-                    sc_piece = prefix + sc
+                    sc_text = sc.document
+                    sc_piece = prefix + sc_text
                     if len(current) + len(sc_piece) + (1 if current else 0) <= self.chunk_size:
-                        current = current + '\n' + sc_piece if current else sc_piece
+                        if current:
+                            current = current + '\n' + sc_piece
+                        else:
+                            current = sc_piece
+                            content_path = path
                     else:
                         if current.strip():
-                            chunks.append(current)
-                        # 代码切分禁用 char-level overlap，避免拆碎语句；其余类型保留 overlap 衔接
-                        # overlap 置于 prefix 之后、sc 之前，保证路径前缀始终在 chunk 头部
-                        if self.overlap > 0 and self.doc_type != 'code' and chunks:
-                            tail = chunks[-1][-self.overlap:]
-                            overlap_piece = prefix + tail + sc
+                            chunks.append(_new_chunk(current, path=content_path))
+                            prev_tail = current[-self.overlap:] if self.overlap > 0 else ''
+                        if self.overlap > 0 and self.doc_type != 'code' and prev_tail:
+                            overlap_piece = prefix + prev_tail + sc_text
                             if len(overlap_piece) <= self.chunk_size:
                                 current = overlap_piece
                             else:
                                 current = sc_piece
                         else:
                             current = sc_piece
-            current_path = path
+                        content_path = path
 
         if current.strip():
-            chunks.append(current)
+            chunks.append(_new_chunk(current, path=content_path))
         return chunks
 
-    def split(self, text: str) -> list[str]:
+    def split(self, text: str) -> list[Chunk]:
         if not text:
             return []
         if self.doc_type == 'markdown':
@@ -612,200 +644,54 @@ class StructuralChunking(ChunkingStrategy):
 
 class ParentChildChunking(ChunkingStrategy):
     """
-    父子切分策略（两阶段切分）
-    先将整篇文本切分为较大的「父块」，再在每个父块内切分为较小的「子块」，
-    检索时可以用子块匹配、用父块补充上下文（Parent Document Retrieval）。
+    父子切分策略（两阶段切分，依赖注入）
 
-    父块与子块的切分方式相互独立，均可通过请求参数指定：
-    - parent_strategy：父块切分方式，默认 recursive（递归切分）
-    - child_strategy：子块切分方式，默认 semantic（语义切分）
-    请求参数未传，或传入了无法匹配到具体切分方式的值时，回退到各自默认切分方式。
+    接收两个已构造好的 ChunkingStrategy 实例：
+      - parent_splitter：父块切分器
+      - child_splitter：子块切分器
+    切分时先将整篇文本切成较大的父块，再在每个父块内切出较小的子块。
+    检索时可用子块匹配、用父块补充上下文（Parent Document Retrieval）。
 
-    split() 返回全部子块（叶子分块）；
-    split_with_parents() 额外保留「子块 -> 所属父块」的对应关系。
+    split() 返回全部子块 Chunk；每个子块通过 .parent 引用所属父块对象，
+    并在 metadata['parent_id'] 中记录父块雪花 ID（可序列化跨引用）。
     """
 
-    # 默认父块 / 子块切分方式
-    DEFAULT_PARENT_STRATEGY = 'recursive'
-    DEFAULT_CHILD_STRATEGY = 'semantic'
-
-    # 请求参数可用的切分方式别名：规范名 -> 候选值（含中文枚举名/中文简称）
-    _STRATEGY_ALIASES = {
-        'fixed_length': ('fixed_length', 'fixedlength', '定长切分', '定长'),
-        'semantic': ('semantic', '语义切分', '语义'),
-        'recursive': ('recursive', '递归切分', '递归'),
-        'structural': ('structural', '结构切分', '结构'),
-    }
-
-    def __init__(self, *, parent_strategy: str = None, child_strategy: str = None,
-                 parent_chunk_size: int = 1000, parent_overlap: int = 100,
-                 child_chunk_size: int = 300, child_overlap: int = 30,
-                 threshold: float = 0.51, embed_fn=None, doc_type: str = 'markdown'):
+    def __init__(self, parent_splitter: ChunkingStrategy, child_splitter: ChunkingStrategy):
         """
-        所有参数均以关键字方式接收，模拟请求参数直接传入
-
-        :param parent_strategy: 父块切分方式请求参数，可传策略名/枚举值/中文名
-                                （如 recursive、ChunkingStrategyEnum.递归切分、递归切分），
-                                未传或匹配不上时默认 recursive
-        :param child_strategy: 子块切分方式请求参数，取值同上，
-                               未传或匹配不上时默认 semantic
-        :param parent_chunk_size: 父块的 chunk_size；父块为语义切分时作为 max_chunk_size
-        :param parent_overlap: 父块的 overlap（语义切分不使用）
-        :param child_chunk_size: 子块的 chunk_size；子块为语义切分时作为 max_chunk_size
-        :param child_overlap: 子块的 overlap（语义切分不使用）
-        :param threshold: 语义切分时的相似度阈值
-        :param embed_fn: 语义切分使用的嵌入函数/模型，默认使用 SentenceTransformer
-        :param doc_type: 结构切分时的文档类型，可选 markdown/html/docx/code
+        :param parent_splitter: 父块切分器实例（由外部构造并注入）
+        :param child_splitter: 子块切分器实例（由外部构造并注入）
         """
-        self.parent_chunk_size = parent_chunk_size
-        self.parent_overlap = parent_overlap
-        self.child_chunk_size = child_chunk_size
-        self.child_overlap = child_overlap
-        self.threshold = threshold
-        self.embed_fn = embed_fn
-        self.doc_type = doc_type
+        self.parent_splitter = parent_splitter
+        self.child_splitter = child_splitter
 
-        # 请求参数解析：能匹配则用请求值，匹配不上或未传则回退默认切分方式
-        self.parent_strategy = self._resolve_request_strategy(
-            parent_strategy, self.DEFAULT_PARENT_STRATEGY)
-        self.child_strategy = self._resolve_request_strategy(
-            child_strategy, self.DEFAULT_CHILD_STRATEGY)
-
-        # 内置父/子切分器实例，父/子切分参数通过请求参数分开控制
-        self.parent_splitter = SplitterFactory.create_strategy(
-            self.parent_strategy, **self._strategy_kwargs('parent'))
-        self.child_splitter = SplitterFactory.create_strategy(
-            self.child_strategy, **self._strategy_kwargs('child'))
-
-    @classmethod
-    def _normalize_strategy(cls, method) -> str | None:
+    def configure(self, parent_splitter: ChunkingStrategy = None,
+                  child_splitter: ChunkingStrategy = None) -> None:
         """
-        将请求参数中的切分方式归一化为规范策略名
-        :param method: 请求参数值，支持 ChunkingStrategyEnum、英文策略名、中文枚举名/简称
-        :return: 规范策略名；无法匹配返回 None
+        批量替换切分器实例，未传入的保持原值
+        :param parent_splitter: 新的父块切分器实例
+        :param child_splitter: 新的子块切分器实例
         """
-        if isinstance(method, ChunkingStrategyEnum):
-            method = method.value
-        if not isinstance(method, str):
-            return None
-        target = method.strip().lower()
-        for canonical, aliases in cls._STRATEGY_ALIASES.items():
-            if target in aliases:
-                return canonical
-        return None
+        if parent_splitter is not None:
+            self.parent_splitter = parent_splitter
+        if child_splitter is not None:
+            self.child_splitter = child_splitter
 
-    @classmethod
-    def _resolve_request_strategy(cls, method: str, default: str) -> str:
+    def split(self, text: str) -> list[Chunk]:
         """
-        请求切分方式解析：匹配不上或未传时使用默认切分方式
-        :param method: 请求参数值
-        :param default: 默认切分方式
-        :return: 最终使用的切分方式名
-        """
-        resolved = cls._normalize_strategy(method)
-        return resolved if resolved is not None else default
-
-    def _strategy_kwargs(self, role: str) -> dict:
-        """
-        按角色与具体切分方式组装创建/配置参数
-        :param role: 'parent'（父块）或 'child'（子块）
-        """
-        if role == 'parent':
-            strategy_name = self.parent_strategy
-            chunk_size = self.parent_chunk_size
-            overlap = self.parent_overlap
-        else:
-            strategy_name = self.child_strategy
-            chunk_size = self.child_chunk_size
-            overlap = self.child_overlap
-
-        if strategy_name == ChunkingStrategyEnum.语义切分.value:
-            return {
-                'threshold': self.threshold,
-                'max_chunk_size': chunk_size,
-                'embed_fn': self.embed_fn,
-            }
-
-        kwargs = {'chunk_size': chunk_size, 'overlap': overlap}
-        if strategy_name == ChunkingStrategyEnum.结构切分.value:
-            kwargs['doc_type'] = self.doc_type
-        return kwargs
-
-    def configure(self, *, parent_strategy: str = None, child_strategy: str = None,
-                  parent_chunk_size: int = None, parent_overlap: int = None,
-                  child_chunk_size: int = None, child_overlap: int = None,
-                  threshold: float = None, embed_fn=None, doc_type: str = None) -> None:
-        """
-        批量设置构造参数，未传入的参数保持原值不变；
-        传入的切分方式匹配不上时回退到默认切分方式
-        :param kwargs: 与 __init__ 同名的可选参数
-        """
-        # 先解析切分方式请求参数（未传保持原值，传了匹配不上回退默认）
-        new_parent_strategy = self.parent_strategy
-        if parent_strategy is not None:
-            new_parent_strategy = self._resolve_request_strategy(
-                parent_strategy, self.DEFAULT_PARENT_STRATEGY)
-        new_child_strategy = self.child_strategy
-        if child_strategy is not None:
-            new_child_strategy = self._resolve_request_strategy(
-                child_strategy, self.DEFAULT_CHILD_STRATEGY)
-
-        # 尺寸等其余参数
-        if parent_chunk_size is not None:
-            self.parent_chunk_size = parent_chunk_size
-        if parent_overlap is not None:
-            self.parent_overlap = parent_overlap
-        if child_chunk_size is not None:
-            self.child_chunk_size = child_chunk_size
-        if child_overlap is not None:
-            self.child_overlap = child_overlap
-        if threshold is not None:
-            self.threshold = threshold
-        if embed_fn is not None:
-            self.embed_fn = embed_fn
-        if doc_type is not None:
-            self.doc_type = doc_type
-
-        # 切分方式变化时重建对应切分器，未变化时原地 configure 复用实例
-        if new_parent_strategy != self.parent_strategy:
-            self.parent_strategy = new_parent_strategy
-            self.parent_splitter = SplitterFactory.create_strategy(
-                self.parent_strategy, **self._strategy_kwargs('parent'))
-        else:
-            self.parent_splitter.configure(**self._strategy_kwargs('parent'))
-
-        if new_child_strategy != self.child_strategy:
-            self.child_strategy = new_child_strategy
-            self.child_splitter = SplitterFactory.create_strategy(
-                self.child_strategy, **self._strategy_kwargs('child'))
-        else:
-            self.child_splitter.configure(**self._strategy_kwargs('child'))
-
-    def split_parents(self, text: str) -> list[str]:
-        """仅执行父切分，返回父块列表"""
-        return self.parent_splitter.split(text)
-
-    def split_with_parents(self, text: str) -> list[dict]:
-        """
-        父子切分并保留对应关系
-        :param text: 待切分文本
-        :return: [{'parent': 所属父块, 'child': 子块}, ...]
+        先父切分、再对每个父块子切分，返回全部子块 Chunk。
+        每个子块：
+          - .parent 指向所属父块 Chunk 对象（内存引用，不重复存储）
+          - metadata['parent_id'] = 父块雪花 ID（可序列化跨引用）
         """
         if not text:
             return []
-        records = []
+        children: list[Chunk] = []
         for parent in self.parent_splitter.split(text):
-            for child in self.child_splitter.split(parent):
-                records.append({'parent': parent, 'child': child})
-        return records
-
-    def split(self, text: str) -> list[str]:
-        """先父切分、再对每个父块子切分，返回全部子块"""
-        if not text:
-            return []
-        children = []
-        for parent in self.parent_splitter.split(text):
-            children.extend(self.child_splitter.split(parent))
+            parent_id = parent.metadata.get('chunk_id')
+            for child in self.child_splitter.split(parent.document):
+                child.parent = parent
+                child.metadata['parent_id'] = parent_id
+                children.append(child)
         return children
 
 
@@ -884,8 +770,18 @@ class TextSplitter:
             self._cache[key] = self.strategy
             return None
 
-    def split(self, text: str) -> list[str]:
-        """委托当前策略执行切分"""
+    def get_cached_strategy(self, name: str) -> Optional[ChunkingStrategy]:
+        """
+        从缓存取已构造的策略实例，未命中返回 None。
+        调用方自负其责：父子同名策略且配置不同时，不要从缓存取，
+        应直接通过 SplitterFactory.create_strategy 另建独立实例。
+        """
+        if not name:
+            return None
+        return self._cache.get(name.lower())
+
+    def split(self, text: str) -> list[Chunk]:
+        """委托当前策略执行切分，返回 Chunk 列表"""
         return self.strategy.split(text)
 
 
@@ -902,13 +798,13 @@ if __name__ == '__main__':
     text_splitter.set_strategy(ChunkingStrategyEnum.定长切分.value, chunk_size=20, overlap=2)
     print("\n【定长切分】")
     for i, chunk in enumerate(text_splitter.split(sample)):
-        print(f"  chunk{i}: {chunk!r}")
+        print(f"  chunk{i}(id={chunk.metadata['chunk_id']}): {chunk.document!r}")
 
     # 2. 语义切分
     text_splitter.set_strategy(name=ChunkingStrategyEnum.语义切分.value)
     print("\n【语义切分】")
     for i, chunk in enumerate(text_splitter.split(sample)):
-        print(f"  chunk{i}: {chunk!r}")
+        print(f"  chunk{i}(id={chunk.metadata['chunk_id']}): {chunk.document!r}")
 
     # 3. 递归切分：段落 → 句子 → 标点 → 空格 → 定长，小分片拼接逼近 chunk_size，保留 overlap
     recursive_sample = (
@@ -922,7 +818,7 @@ if __name__ == '__main__':
     text_splitter.set_strategy(ChunkingStrategyEnum.递归切分.value, chunk_size=60, overlap=20)
     print("\n【递归切分】")
     for i, chunk in enumerate(text_splitter.split(recursive_sample)):
-        print(f"  chunk{i}({len(chunk)}字符): {chunk!r}")
+        print(f"  chunk{i}({len(chunk.document)}字符, id={chunk.metadata['chunk_id']}): {chunk.document!r}")
 
     # 4. 结构切分：按文档类型识别结构单元，chunk 头部保留标题路径，结构内递归切分 + overlap
     # 4.1 markdown
@@ -938,7 +834,7 @@ if __name__ == '__main__':
     text_splitter.set_strategy(ChunkingStrategyEnum.结构切分.value, chunk_size=60, overlap=10, doc_type='markdown')
     print("\n【结构切分-markdown】")
     for i, chunk in enumerate(text_splitter.split(md_sample)):
-        print(f"  chunk{i}({len(chunk)}字符): {chunk!r}")
+        print(f"  chunk{i}({len(chunk.document)}字符, path={chunk.metadata.get('path')!r}): {chunk.document!r}")
 
     # 4.2 html
     html_sample = (
@@ -952,7 +848,7 @@ if __name__ == '__main__':
     text_splitter.set_strategy(ChunkingStrategyEnum.结构切分.value, chunk_size=60, overlap=10, doc_type='html')
     print("\n【结构切分-html】")
     for i, chunk in enumerate(text_splitter.split(html_sample)):
-        print(f"  chunk{i}({len(chunk)}字符): {chunk!r}")
+        print(f"  chunk{i}({len(chunk.document)}字符, path={chunk.metadata.get('path')!r}): {chunk.document!r}")
 
     # 4.3 docx（解析后以「Heading N: 标题」标记层级）
     docx_sample = (
@@ -966,7 +862,7 @@ if __name__ == '__main__':
     text_splitter.set_strategy(ChunkingStrategyEnum.结构切分.value, chunk_size=60, overlap=10, doc_type='docx')
     print("\n【结构切分-docx】")
     for i, chunk in enumerate(text_splitter.split(docx_sample)):
-        print(f"  chunk{i}({len(chunk)}字符): {chunk!r}")
+        print(f"  chunk{i}({len(chunk.document)}字符, path={chunk.metadata.get('path')!r}): {chunk.document!r}")
 
     # 4.4 代码
     code_sample = (
@@ -980,10 +876,9 @@ if __name__ == '__main__':
     text_splitter.set_strategy(ChunkingStrategyEnum.结构切分.value, chunk_size=60, overlap=10, doc_type='code')
     print("\n【结构切分-code】")
     for i, chunk in enumerate(text_splitter.split(code_sample)):
-        print(f"  chunk{i}({len(chunk)}字符): {chunk!r}")
+        print(f"  chunk{i}({len(chunk.document)}字符, path={chunk.metadata.get('path')!r}): {chunk.document!r}")
 
-    # 5. 父子切分：先切较大的父块，再对每个父块切较小的子块
-    # 5.1 父/子切分方式都未传（或匹配不上）时，父块默认 recursive、子块默认 semantic
+    # 5. 父子切分：先切较大的父块，再对每个父块切较小的子块（依赖注入）
     parent_child_sample = (
         "人工智能是计算机科学的一个分支，旨在让机器模拟人类智能。\n"
         "机器学习通过大量数据训练模型，使计算机具备自动学习规律的能力。\n"
@@ -996,36 +891,37 @@ if __name__ == '__main__':
         "薛定谔方程描述量子态演化，海森堡不确定性原理揭示了测量的极限。\n"
         "量子纠缠等奇特现象正在推动量子计算与量子通信技术的发展。\n"
     )
-    text_splitter.set_strategy(
-        ChunkingStrategyEnum.父子切分.value,
-        parent_chunk_size=120, child_chunk_size=60,
-    )
-    print("\n【父子切分-默认配置】")
-    print(f"  父块策略: {text_splitter.strategy.parent_strategy}，子块策略: {text_splitter.strategy.child_strategy}")
-    records = text_splitter.strategy.split_with_parents(parent_child_sample)
-    print(f"  共生成 {len(records)} 个子块（可检索子块、用父块补充上下文）")
-    for i, record in enumerate(records):
-        print(f"  child{i}: {record['child']!r}")
-        print(f"         所属父块: {record['parent']!r}")
 
-    # 5.2 通过请求参数指定父/子切分方式（支持枚举值、英文策略名、中文别名）
-    text_splitter.set_strategy(
-        ChunkingStrategyEnum.父子切分.value,
-        parent_strategy=ChunkingStrategyEnum.定长切分.value,  # 父块使用定长切分
-        child_strategy='递归',                                 # 子块使用递归切分（中文简称）
-        parent_chunk_size=120, parent_overlap=20,
-        child_chunk_size=60, child_overlap=10,
-    )
-    print("\n【父子切分-请求指定切分方式】")
-    print(f"  父块策略: {text_splitter.strategy.parent_strategy}，子块策略: {text_splitter.strategy.child_strategy}")
-    for i, chunk in enumerate(text_splitter.split(parent_child_sample)):
-        print(f"  chunk{i}({len(chunk)}字符): {chunk!r}")
+    # 5.1 通过 get_cached_strategy 复用缓存中的切分器，或走工厂新建
+    text_splitter.set_strategy(ChunkingStrategyEnum.递归切分.value, chunk_size=60, overlap=20)
+    parent_splitter = text_splitter.get_cached_strategy('recursive')
+    text_splitter.set_strategy(ChunkingStrategyEnum.语义切分.value, max_chunk_size=32)
+    child_splitter = text_splitter.get_cached_strategy('semantic')
 
-    # 5.3 请求参数传了无法匹配的切分方式时，回退默认（父块 recursive、子块 semantic）
     text_splitter.set_strategy(
         ChunkingStrategyEnum.父子切分.value,
-        parent_strategy='未知的切分算法',
-        child_strategy='匹配不上的算法',
+        parent_splitter=parent_splitter, child_splitter=child_splitter,
     )
-    print("\n【父子切分-匹配失败回退默认】")
-    print(f"  父块策略: {text_splitter.strategy.parent_strategy}，子块策略: {text_splitter.strategy.child_strategy}")
+    print("\n【父子切分-依赖注入】")
+    chunks = text_splitter.split(parent_child_sample)
+    print(f"  共生成 {len(chunks)} 个子块（子块带 parent 引用与 parent_id）")
+    for i, chunk in enumerate(chunks):
+        parent = chunk.parent
+        print(f"  child{i}(id={chunk.metadata['chunk_id']}): {chunk.document!r}")
+        print(f"         parent_id={chunk.metadata.get('parent_id')}, "
+              f"所属父块: {parent.document!r}")
+
+    # 5.2 父/子均用递归切分（配置不同），需各自独立实例，不复用缓存
+    parent_splitter2 = SplitterFactory.create_strategy('recursive', chunk_size=60, overlap=20)
+    child_splitter2 = SplitterFactory.create_strategy('recursive', chunk_size=32, overlap=10)
+    text_splitter.set_strategy(
+        ChunkingStrategyEnum.父子切分.value,
+        parent_splitter=parent_splitter2, child_splitter=child_splitter2,
+    )
+    print("\n【父子切分-父子同名不同配置】")
+    print(f"  共生成 {len(chunks)} 个子块（子块带 parent 引用与 parent_id）")
+    for i, chunk in enumerate(chunks):
+        parent = chunk.parent
+        print(f"  child{i}(id={chunk.metadata['chunk_id']}): {chunk.document!r}")
+        print(f"         parent_id={chunk.metadata.get('parent_id')}, "
+              f"所属父块: {parent.document!r}")

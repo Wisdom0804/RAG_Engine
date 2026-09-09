@@ -21,6 +21,7 @@ class Secure(BaseSettings):
     APP_PORT: int
     APP_HOST: str
     APP_DEBUG: bool
+    MACHINE_ID: int
     # 阿里模型
     QWEN_API_KEY:str
     QWEN_API_BASE:str
