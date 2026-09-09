@@ -20,3 +20,5 @@ class ChunkingStrategyEnum(Enum):
     """
     定长切分 = 'fixed_length'
     语义切分 = 'semantic'
+    递归切分 = 'recursive'
+    结构切分 = 'structural'
