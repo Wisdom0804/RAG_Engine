@@ -610,6 +610,205 @@ class StructuralChunking(ChunkingStrategy):
         return self._build_chunks(units)
 
 
+class ParentChildChunking(ChunkingStrategy):
+    """
+    父子切分策略（两阶段切分）
+    先将整篇文本切分为较大的「父块」，再在每个父块内切分为较小的「子块」，
+    检索时可以用子块匹配、用父块补充上下文（Parent Document Retrieval）。
+
+    父块与子块的切分方式相互独立，均可通过请求参数指定：
+    - parent_strategy：父块切分方式，默认 recursive（递归切分）
+    - child_strategy：子块切分方式，默认 semantic（语义切分）
+    请求参数未传，或传入了无法匹配到具体切分方式的值时，回退到各自默认切分方式。
+
+    split() 返回全部子块（叶子分块）；
+    split_with_parents() 额外保留「子块 -> 所属父块」的对应关系。
+    """
+
+    # 默认父块 / 子块切分方式
+    DEFAULT_PARENT_STRATEGY = 'recursive'
+    DEFAULT_CHILD_STRATEGY = 'semantic'
+
+    # 请求参数可用的切分方式别名：规范名 -> 候选值（含中文枚举名/中文简称）
+    _STRATEGY_ALIASES = {
+        'fixed_length': ('fixed_length', 'fixedlength', '定长切分', '定长'),
+        'semantic': ('semantic', '语义切分', '语义'),
+        'recursive': ('recursive', '递归切分', '递归'),
+        'structural': ('structural', '结构切分', '结构'),
+    }
+
+    def __init__(self, *, parent_strategy: str = None, child_strategy: str = None,
+                 parent_chunk_size: int = 1000, parent_overlap: int = 100,
+                 child_chunk_size: int = 300, child_overlap: int = 30,
+                 threshold: float = 0.51, embed_fn=None, doc_type: str = 'markdown'):
+        """
+        所有参数均以关键字方式接收，模拟请求参数直接传入
+
+        :param parent_strategy: 父块切分方式请求参数，可传策略名/枚举值/中文名
+                                （如 recursive、ChunkingStrategyEnum.递归切分、递归切分），
+                                未传或匹配不上时默认 recursive
+        :param child_strategy: 子块切分方式请求参数，取值同上，
+                               未传或匹配不上时默认 semantic
+        :param parent_chunk_size: 父块的 chunk_size；父块为语义切分时作为 max_chunk_size
+        :param parent_overlap: 父块的 overlap（语义切分不使用）
+        :param child_chunk_size: 子块的 chunk_size；子块为语义切分时作为 max_chunk_size
+        :param child_overlap: 子块的 overlap（语义切分不使用）
+        :param threshold: 语义切分时的相似度阈值
+        :param embed_fn: 语义切分使用的嵌入函数/模型，默认使用 SentenceTransformer
+        :param doc_type: 结构切分时的文档类型，可选 markdown/html/docx/code
+        """
+        self.parent_chunk_size = parent_chunk_size
+        self.parent_overlap = parent_overlap
+        self.child_chunk_size = child_chunk_size
+        self.child_overlap = child_overlap
+        self.threshold = threshold
+        self.embed_fn = embed_fn
+        self.doc_type = doc_type
+
+        # 请求参数解析：能匹配则用请求值，匹配不上或未传则回退默认切分方式
+        self.parent_strategy = self._resolve_request_strategy(
+            parent_strategy, self.DEFAULT_PARENT_STRATEGY)
+        self.child_strategy = self._resolve_request_strategy(
+            child_strategy, self.DEFAULT_CHILD_STRATEGY)
+
+        # 内置父/子切分器实例，父/子切分参数通过请求参数分开控制
+        self.parent_splitter = SplitterFactory.create_strategy(
+            self.parent_strategy, **self._strategy_kwargs('parent'))
+        self.child_splitter = SplitterFactory.create_strategy(
+            self.child_strategy, **self._strategy_kwargs('child'))
+
+    @classmethod
+    def _normalize_strategy(cls, method) -> str | None:
+        """
+        将请求参数中的切分方式归一化为规范策略名
+        :param method: 请求参数值，支持 ChunkingStrategyEnum、英文策略名、中文枚举名/简称
+        :return: 规范策略名；无法匹配返回 None
+        """
+        if isinstance(method, ChunkingStrategyEnum):
+            method = method.value
+        if not isinstance(method, str):
+            return None
+        target = method.strip().lower()
+        for canonical, aliases in cls._STRATEGY_ALIASES.items():
+            if target in aliases:
+                return canonical
+        return None
+
+    @classmethod
+    def _resolve_request_strategy(cls, method: str, default: str) -> str:
+        """
+        请求切分方式解析：匹配不上或未传时使用默认切分方式
+        :param method: 请求参数值
+        :param default: 默认切分方式
+        :return: 最终使用的切分方式名
+        """
+        resolved = cls._normalize_strategy(method)
+        return resolved if resolved is not None else default
+
+    def _strategy_kwargs(self, role: str) -> dict:
+        """
+        按角色与具体切分方式组装创建/配置参数
+        :param role: 'parent'（父块）或 'child'（子块）
+        """
+        if role == 'parent':
+            strategy_name = self.parent_strategy
+            chunk_size = self.parent_chunk_size
+            overlap = self.parent_overlap
+        else:
+            strategy_name = self.child_strategy
+            chunk_size = self.child_chunk_size
+            overlap = self.child_overlap
+
+        if strategy_name == ChunkingStrategyEnum.语义切分.value:
+            return {
+                'threshold': self.threshold,
+                'max_chunk_size': chunk_size,
+                'embed_fn': self.embed_fn,
+            }
+
+        kwargs = {'chunk_size': chunk_size, 'overlap': overlap}
+        if strategy_name == ChunkingStrategyEnum.结构切分.value:
+            kwargs['doc_type'] = self.doc_type
+        return kwargs
+
+    def configure(self, *, parent_strategy: str = None, child_strategy: str = None,
+                  parent_chunk_size: int = None, parent_overlap: int = None,
+                  child_chunk_size: int = None, child_overlap: int = None,
+                  threshold: float = None, embed_fn=None, doc_type: str = None) -> None:
+        """
+        批量设置构造参数，未传入的参数保持原值不变；
+        传入的切分方式匹配不上时回退到默认切分方式
+        :param kwargs: 与 __init__ 同名的可选参数
+        """
+        # 先解析切分方式请求参数（未传保持原值，传了匹配不上回退默认）
+        new_parent_strategy = self.parent_strategy
+        if parent_strategy is not None:
+            new_parent_strategy = self._resolve_request_strategy(
+                parent_strategy, self.DEFAULT_PARENT_STRATEGY)
+        new_child_strategy = self.child_strategy
+        if child_strategy is not None:
+            new_child_strategy = self._resolve_request_strategy(
+                child_strategy, self.DEFAULT_CHILD_STRATEGY)
+
+        # 尺寸等其余参数
+        if parent_chunk_size is not None:
+            self.parent_chunk_size = parent_chunk_size
+        if parent_overlap is not None:
+            self.parent_overlap = parent_overlap
+        if child_chunk_size is not None:
+            self.child_chunk_size = child_chunk_size
+        if child_overlap is not None:
+            self.child_overlap = child_overlap
+        if threshold is not None:
+            self.threshold = threshold
+        if embed_fn is not None:
+            self.embed_fn = embed_fn
+        if doc_type is not None:
+            self.doc_type = doc_type
+
+        # 切分方式变化时重建对应切分器，未变化时原地 configure 复用实例
+        if new_parent_strategy != self.parent_strategy:
+            self.parent_strategy = new_parent_strategy
+            self.parent_splitter = SplitterFactory.create_strategy(
+                self.parent_strategy, **self._strategy_kwargs('parent'))
+        else:
+            self.parent_splitter.configure(**self._strategy_kwargs('parent'))
+
+        if new_child_strategy != self.child_strategy:
+            self.child_strategy = new_child_strategy
+            self.child_splitter = SplitterFactory.create_strategy(
+                self.child_strategy, **self._strategy_kwargs('child'))
+        else:
+            self.child_splitter.configure(**self._strategy_kwargs('child'))
+
+    def split_parents(self, text: str) -> list[str]:
+        """仅执行父切分，返回父块列表"""
+        return self.parent_splitter.split(text)
+
+    def split_with_parents(self, text: str) -> list[dict]:
+        """
+        父子切分并保留对应关系
+        :param text: 待切分文本
+        :return: [{'parent': 所属父块, 'child': 子块}, ...]
+        """
+        if not text:
+            return []
+        records = []
+        for parent in self.parent_splitter.split(text):
+            for child in self.child_splitter.split(parent):
+                records.append({'parent': parent, 'child': child})
+        return records
+
+    def split(self, text: str) -> list[str]:
+        """先父切分、再对每个父块子切分，返回全部子块"""
+        if not text:
+            return []
+        children = []
+        for parent in self.parent_splitter.split(text):
+            children.extend(self.child_splitter.split(parent))
+        return children
+
+
 class SplitterFactory:
     """
     分块策略工厂
@@ -623,6 +822,7 @@ class SplitterFactory:
         'semantic': SemanticChunking,
         'recursive': RecursiveChunking,
         'structural': StructuralChunking,
+        'parent_child': ParentChildChunking,
     }
 
     @classmethod
@@ -781,3 +981,51 @@ if __name__ == '__main__':
     print("\n【结构切分-code】")
     for i, chunk in enumerate(text_splitter.split(code_sample)):
         print(f"  chunk{i}({len(chunk)}字符): {chunk!r}")
+
+    # 5. 父子切分：先切较大的父块，再对每个父块切较小的子块
+    # 5.1 父/子切分方式都未传（或匹配不上）时，父块默认 recursive、子块默认 semantic
+    parent_child_sample = (
+        "人工智能是计算机科学的一个分支，旨在让机器模拟人类智能。\n"
+        "机器学习通过大量数据训练模型，使计算机具备自动学习规律的能力。\n"
+        "深度学习利用多层神经网络进行特征提取，是机器学习的重要子领域。\n"
+        "大语言模型在海量文本上预训练，能够完成翻译、问答、摘要等生成任务。\n\n"
+        "火锅起源于川渝地区，以麻辣鲜香著称，是中国最具代表性的美食之一。\n"
+        "粤式早茶讲究精细，虾饺、烧卖、肠粉等都是经典茶点。\n"
+        "江浙菜口味偏甜，擅长清蒸与红烧，代表菜品有西湖醋鱼、东坡肉。\n\n"
+        "量子力学研究微观世界的运动规律，与相对论并称现代物理两大支柱。\n"
+        "薛定谔方程描述量子态演化，海森堡不确定性原理揭示了测量的极限。\n"
+        "量子纠缠等奇特现象正在推动量子计算与量子通信技术的发展。\n"
+    )
+    text_splitter.set_strategy(
+        ChunkingStrategyEnum.父子切分.value,
+        parent_chunk_size=120, child_chunk_size=60,
+    )
+    print("\n【父子切分-默认配置】")
+    print(f"  父块策略: {text_splitter.strategy.parent_strategy}，子块策略: {text_splitter.strategy.child_strategy}")
+    records = text_splitter.strategy.split_with_parents(parent_child_sample)
+    print(f"  共生成 {len(records)} 个子块（可检索子块、用父块补充上下文）")
+    for i, record in enumerate(records):
+        print(f"  child{i}: {record['child']!r}")
+        print(f"         所属父块: {record['parent']!r}")
+
+    # 5.2 通过请求参数指定父/子切分方式（支持枚举值、英文策略名、中文别名）
+    text_splitter.set_strategy(
+        ChunkingStrategyEnum.父子切分.value,
+        parent_strategy=ChunkingStrategyEnum.定长切分.value,  # 父块使用定长切分
+        child_strategy='递归',                                 # 子块使用递归切分（中文简称）
+        parent_chunk_size=120, parent_overlap=20,
+        child_chunk_size=60, child_overlap=10,
+    )
+    print("\n【父子切分-请求指定切分方式】")
+    print(f"  父块策略: {text_splitter.strategy.parent_strategy}，子块策略: {text_splitter.strategy.child_strategy}")
+    for i, chunk in enumerate(text_splitter.split(parent_child_sample)):
+        print(f"  chunk{i}({len(chunk)}字符): {chunk!r}")
+
+    # 5.3 请求参数传了无法匹配的切分方式时，回退默认（父块 recursive、子块 semantic）
+    text_splitter.set_strategy(
+        ChunkingStrategyEnum.父子切分.value,
+        parent_strategy='未知的切分算法',
+        child_strategy='匹配不上的算法',
+    )
+    print("\n【父子切分-匹配失败回退默认】")
+    print(f"  父块策略: {text_splitter.strategy.parent_strategy}，子块策略: {text_splitter.strategy.child_strategy}")

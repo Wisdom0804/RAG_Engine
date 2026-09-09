@@ -22,3 +22,4 @@ class ChunkingStrategyEnum(Enum):
     语义切分 = 'semantic'
     递归切分 = 'recursive'
     结构切分 = 'structural'
+    父子切分 = 'parent_child'
