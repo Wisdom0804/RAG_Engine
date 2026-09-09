@@ -99,7 +99,7 @@ class SemanticChunking(ChunkingStrategy):
     通过 max_chunk_size 限制最大分片大小，防止语义高度连贯时产生超大分片
     """
 
-    def __init__(self, embed_fn=None, threshold: float = 0.5, max_chunk_size: int = 1000):
+    def __init__(self, embed_fn=None, threshold: float = 0.51, max_chunk_size: int = 1000):
         """
         :param embed_fn: 嵌入函数/模型，需支持 encode(list[str]) -> ndarray，
                          默认使用 SentenceTransformer("all-MiniLM-L6-v2")
