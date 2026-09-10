@@ -22,6 +22,15 @@ class Secure(BaseSettings):
     APP_HOST: str
     APP_DEBUG: bool
     MACHINE_ID: int
+
+    # PostgreSQL连接配置
+    POSTGRE_DATABASE_URL: str
+    POSTGRE_HOST: str
+    POSTGRE_PORT: str
+    POSTGRE_USER: str
+    POSTGRE_PASSWORD: str
+    POSTGRE_DB: str
+
     # 阿里模型
     QWEN_API_KEY:str
     QWEN_API_BASE:str
