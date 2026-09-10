@@ -124,18 +124,18 @@ class SemanticChunking(ChunkingStrategy):
     通过 max_chunk_size 限制最大分片大小，防止语义高度连贯时产生超大分片，超大分片按三层降级切分
     """
 
-    def __init__(self, embed_fn=None, threshold: float = 0.51, max_chunk_size: int = 1000):
+    def __init__(self, embed_fn=None, threshold: float = 0.51, chunk_size: int = 1000):
         """
         :param embed_fn: 嵌入函数/模型，需支持 encode(list[str]) -> ndarray，
                          默认使用 SentenceTransformer("BAAI/bge-small-zh-v1.5")（中文小模型，约 95MB）
         :param threshold: 相似度阈值，低于该值则断开，取值范围 [0, 1]
-        :param max_chunk_size: 单个分块的最大字符长度，超过则按三层降级切分（语义二分 → 弱边界 → 定长兜底）
+        :param chunk_size: 单个分块的最大字符长度，超过则按三层降级切分（语义二分 → 弱边界 → 定长兜底）
         """
         if embed_fn is None:
             embed_fn = SentenceTransformer("BAAI/bge-small-zh-v1.5")
         self.embed_fn = embed_fn
         self.threshold = threshold
-        self.max_chunk_size = max_chunk_size
+        self.max_chunk_size = chunk_size
         # 缩写/小数白名单占位保护映射，_protect 写入、_restore 读取（按 block 生命周期清理）
         self._protect_map: dict[str, str] = {}
         self._validate()
@@ -844,99 +844,3 @@ class TextSplitter:
 
 
 text_splitter = TextSplitter()
-
-if __name__ == '__main__':
-    sample = (
-        "今天天气真好，阳光明媚。我想出去散步，感受大自然。"
-        "量子力学是研究微观粒子运动规律的物理学分支，与相对论并称现代物理两大支柱。"
-        "薛定谔方程描述了量子系统的状态随时间的演化。火锅是四川的传统美食，麻辣鲜香，深受大家喜爱。"
-    )
-
-    # 1. 定长切分
-    text_splitter.set_strategy(ChunkingStrategyEnum.定长切分.value, chunk_size=20, overlap=2)
-    print("\n【定长切分】")
-    for i, chunk in enumerate(text_splitter.split(sample)):
-        print(f"  chunk{i}(id={chunk.metadata['chunk_id']}): {chunk.document!r}")
-
-    # 2. 语义切分
-    text_splitter.set_strategy(name=ChunkingStrategyEnum.语义切分.value)
-    print("\n【语义切分】")
-    for i, chunk in enumerate(text_splitter.split(sample)):
-        print(f"  chunk{i}(id={chunk.metadata['chunk_id']}): {chunk.document!r}")
-
-    # 3. 递归切分：段落 → 句子 → 标点 → 空格 → 定长，小分片拼接逼近 chunk_size，保留 overlap
-    recursive_sample = (
-        "人工智能是计算机科学的一个分支，它企图了解智能的实质。"
-        "机器学习是人工智能的核心，使计算机能够从数据中学习规律。"
-        "深度学习是机器学习的子领域，使用多层神经网络进行特征学习。\n\n"
-        "自然语言处理研究人与计算机之间用自然语言进行有效通信的理论方法。"
-        "大语言模型通过海量文本预训练，掌握语言统计规律，能完成翻译、问答、摘要等任务。"
-        "检索增强生成结合外部知识库与生成模型，缓解幻觉问题。"
-    )
-    text_splitter.set_strategy(ChunkingStrategyEnum.递归切分.value, chunk_size=60, overlap=20)
-    print("\n【递归切分】")
-    for i, chunk in enumerate(text_splitter.split(recursive_sample)):
-        print(f"  chunk{i}({len(chunk.document)}字符, id={chunk.metadata['chunk_id']}): {chunk.document!r}")
-
-    # 4. 结构切分：识别 markdown 标题层级与标题下内容块，chunk 头部保留标题路径，结构内递归切分 + overlap
-    md_sample = (
-        "# RAG 引擎\n"
-        "RAG 结合检索与生成，缓解大模型幻觉。\n"
-        "## 文档解析\n"
-        "支持 PDF、Word、Markdown 等格式的解析，提取结构化文本。"
-        "解析后的文本按段落、标题、表格等结构单元组织，便于后续切分。\n"
-        "## 文档切分\n"
-        "切分策略包括定长、语义、递归、结构切分，需根据文档类型选择合适的策略。"
-    )
-    text_splitter.set_strategy(ChunkingStrategyEnum.结构切分.value, chunk_size=60, overlap=10)
-    print("\n【结构切分-markdown】")
-    for i, chunk in enumerate(text_splitter.split(md_sample)):
-        print(f"  chunk{i}({len(chunk.document)}字符, path={chunk.metadata.get('path')!r}): {chunk.document!r}")
-    #
-    # # 5. 父子切分：先切较大的父块，再对每个父块切较小的子块（依赖注入）
-    # parent_child_sample = (
-    #     "人工智能是计算机科学的一个分支，旨在让机器模拟人类智能。\n"
-    #     "机器学习通过大量数据训练模型，使计算机具备自动学习规律的能力。\n"
-    #     "深度学习利用多层神经网络进行特征提取，是机器学习的重要子领域。\n"
-    #     "大语言模型在海量文本上预训练，能够完成翻译、问答、摘要等生成任务。\n\n"
-    #     "火锅起源于川渝地区，以麻辣鲜香著称，是中国最具代表性的美食之一。\n"
-    #     "粤式早茶讲究精细，虾饺、烧卖、肠粉等都是经典茶点。\n"
-    #     "江浙菜口味偏甜，擅长清蒸与红烧，代表菜品有西湖醋鱼、东坡肉。\n\n"
-    #     "量子力学研究微观世界的运动规律，与相对论并称现代物理两大支柱。\n"
-    #     "薛定谔方程描述量子态演化，海森堡不确定性原理揭示了测量的极限。\n"
-    #     "量子纠缠等奇特现象正在推动量子计算与量子通信技术的发展。\n"
-    # )
-    #
-    # # 5.1 通过 get_cached_strategy 复用缓存中的切分器，或走工厂新建
-    # text_splitter.set_strategy(ChunkingStrategyEnum.递归切分.value, chunk_size=60, overlap=20)
-    # parent_splitter = text_splitter.get_cached_strategy('recursive')
-    # text_splitter.set_strategy(ChunkingStrategyEnum.语义切分.value, max_chunk_size=32)
-    # child_splitter = text_splitter.get_cached_strategy('semantic')
-    #
-    # text_splitter.set_strategy(
-    #     ChunkingStrategyEnum.父子切分.value,
-    #     parent_splitter=parent_splitter, child_splitter=child_splitter,
-    # )
-    # print("\n【父子切分-依赖注入】")
-    # chunks = text_splitter.split(parent_child_sample)
-    # print(f"  共生成 {len(chunks)} 个子块（子块带 parent 引用与 parent_id）")
-    # for i, chunk in enumerate(chunks):
-    #     parent = chunk.parent
-    #     print(f"  child{i}(id={chunk.metadata['chunk_id']}): {chunk.document!r}")
-    #     print(f"         parent_id={chunk.metadata.get('parent_id')}, "
-    #           f"所属父块: {parent.document!r}")
-    #
-    # # 5.2 父/子均用递归切分（配置不同），需各自独立实例，不复用缓存
-    # parent_splitter2 = SplitterFactory.create_strategy(ChunkingStrategyEnum.递归切分.value, chunk_size=60, overlap=20)
-    # child_splitter2 = SplitterFactory.create_strategy(ChunkingStrategyEnum.递归切分.value, chunk_size=32, overlap=10)
-    # text_splitter.set_strategy(
-    #     ChunkingStrategyEnum.父子切分.value,
-    #     parent_splitter=parent_splitter2, child_splitter=child_splitter2,
-    # )
-    # print("\n【父子切分-父子同名不同配置】")
-    # print(f"  共生成 {len(chunks)} 个子块（子块带 parent 引用与 parent_id）")
-    # for i, chunk in enumerate(chunks):
-    #     parent = chunk.parent
-    #     print(f"  child{i}(id={chunk.metadata['chunk_id']}): {chunk.document!r}")
-    #     print(f"         parent_id={chunk.metadata.get('parent_id')}, "
-    #           f"所属父块: {parent.document!r}")

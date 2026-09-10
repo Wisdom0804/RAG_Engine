@@ -32,7 +32,8 @@ class ModelHub:
 
     - 嵌入模型名取 secure.EMBEDDING_NAME，命中 qwen 前缀走 API，否则本地 SentenceTransformer
     - 重排模型名取 secure.RERANK_NAME，命中 qwen 前缀走 API，否则本地 CrossEncoder
-    - embed_fn 属性供 SemanticChunking.configure(embed_fn=...) 注入复用同一 bge 实例（仅本地模式）
+    - embed_fn 属性供 SemanticChunking 注入复用同一 bge 实例（本地模式返回实例；API 模式返回 None，
+      由 SemanticChunking 回退到其默认本地模型 BAAI/bge-small-zh-v1.5）
     """
 
     # 阿里模型名标识（命中则走 API）
@@ -106,9 +107,14 @@ class ModelHub:
 
     @property
     def embed_fn(self):
-        """供 SemanticChunking.configure(embed_fn=...) 注入复用（仅本地模式可注入）"""
+        """供 SemanticChunking.configure(embed_fn=...) 注入复用同一 bge 实例。
+
+        - 本地模式：返回已加载的 SentenceTransformer 实例，复用避免重复加载
+        - API 模式：返回 None，由 SemanticChunking 使用其默认本地模型 BAAI/bge-small-zh-v1.5
+          （语义切分需本地同步 encode 句子相似度，无法用 qwen API 替代）
+        """
         if self._embed_mode != 'local':
-            raise ValueError("切分器注入仅支持本地嵌入模型")
+            return None
         return self._embedder
 
     # ---------- 重排 ----------

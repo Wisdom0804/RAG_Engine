@@ -11,6 +11,7 @@ Copyright (c) 2026 星际区块链（深圳）有限公司. All rights reserved.
 """
 from sqlalchemy import select
 
+from app.libs.enums import ChunkingStrategyEnum
 from app.model import dbs
 from app.model.parent_chunk import ParentChunk
 from tool.rag_engine.chroma_base import ChromaBase
@@ -159,3 +160,47 @@ class RAGBase:
 
 # 模块级单例，与 parser / splitter / chroma_base / model_hub 风格一致
 rag_base = RAGBase()
+
+
+if __name__ == '__main__':
+    import asyncio
+    from root import ROOT_DIR
+    from tool.rag_engine.splitter_base import SplitterFactory
+
+    async def main():
+        doc_path = ROOT_DIR / 'docs' / 'file' / '郑智文.pdf'
+        query = '郑智文的技术栈与项目经验'
+
+        # ---------- 1) 基础流：语义切分 → 入库 → 检索（无重排） ----------
+        # 语义切分不支持 overlap（设计约定：保持语义切分纯净），仅传 chunk_size
+        rag = RAGBase(collection_name='learning')
+        n = await rag.ingest(str(doc_path), ChunkingStrategyEnum.语义切分.value, chunk_size=300)
+        print(f'[semantic] 入库 {n} 条 chunk')
+
+        docs = await rag.retrieve(query, top_k=3)
+        print(f'[retrieve 无重排] 命中 {len(docs)} 条:')
+        for i, d in enumerate(docs, 1):
+            print(f'  {i}. {d[:80].replace(chr(10), " ")}...')
+
+        # ---------- 2) 开启重排 ----------
+        ranked = await rag.retrieve(query, top_k=3, rerank=True)
+        print(f'[retrieve 重排] 命中 {len(ranked)} 条:')
+        for i, d in enumerate(ranked, 1):
+            print(f'  {i}. {d[:80].replace(chr(10), " ")}...')
+
+        # ---------- 3) 父子模式：父块存 PG、子块存 chroma，检索子块反查父块 ----------
+        # 用独立 collection 避免与上面定长 chunk 混检
+        rag_pc = RAGBase(collection_name='parent_child_test')
+        parent = SplitterFactory.create_strategy(ChunkingStrategyEnum.结构切分.value, chunk_size=800, overlap=0)
+        child = SplitterFactory.create_strategy(ChunkingStrategyEnum.语义切分.value, chunk_size=200)
+        n2 = await rag_pc.ingest(str(doc_path), 'parent_child',
+                                 parent_splitter=parent, child_splitter=child)
+        print(f'[parent_child] 入库 {n2} 条子 chunk')
+
+        p_docs = await rag_pc.retrieve(query, top_k=3, rerank=True,
+                                       where={'source_file': str(doc_path)})
+        print(f'[parent_child retrieve] 命中 {len(p_docs)} 条父块:')
+        for i, d in enumerate(p_docs, 1):
+            print(f'  {i}. {d[:80].replace(chr(10), " ")}...')
+
+    asyncio.run(main())
