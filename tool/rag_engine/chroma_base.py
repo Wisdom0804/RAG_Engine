@@ -13,7 +13,7 @@ import asyncio
 from uuid import uuid4
 
 from tool.rag_engine import chromadb_client
-from tool.rag_engine.Schemas.chroma_schemas import ChromaGetResponse
+from tool.rag_engine.Schemas.chroma_schemas import ChromaGetResponse, ChromaQueryResponse
 
 
 class ChromaBase:
@@ -74,11 +74,12 @@ class ChromaBase:
         )
 
     async def query(self, query_embeddings: list[list[float]], n_results: int,
-                    where: dict | None = None) -> list[str]:
+                    where: dict | None = None) -> ChromaQueryResponse:
         """
         按向量相似检索（Read）。嵌入向量由外部计算后传入。
         :param where: 可选，按 metadata 筛选
-        :return: 命中的 documents 列表
+        :return: ChromaQueryResponse，含 ids/documents/metadatas/distances，
+                 供 rerank 与 parent_id 溯源（query 单条，取第一组结果展平）
         """
         kwargs = {
             "query_embeddings": query_embeddings,
@@ -87,7 +88,12 @@ class ChromaBase:
         if where is not None:
             kwargs["where"] = where
         res = await asyncio.to_thread(self.collection.query, **kwargs)
-        return res["documents"][0]
+        return ChromaQueryResponse(
+            ids=res["ids"][0],
+            documents=res["documents"][0],
+            metadatas=res["metadatas"][0],
+            distances=res["distances"][0],
+        )
 
     async def update(self, ids: list[str],
                      documents: list[str] | None = None,
@@ -112,6 +118,10 @@ class ChromaBase:
         按 ID 删除（Delete）。
         """
         await asyncio.to_thread(self.collection.delete, ids=ids)
+
+
+# 模块级单例
+chroma_base = ChromaBase()
 
 
 if __name__ == '__main__':
