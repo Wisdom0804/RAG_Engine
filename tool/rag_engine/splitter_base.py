@@ -13,11 +13,8 @@ import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Optional
-
 import numpy as np
 from sentence_transformers import SentenceTransformer
-
-from app.libs.enums import ChunkingStrategyEnum
 from tool.siem_tool.snow_flake import snow_flake
 
 
@@ -34,12 +31,6 @@ class Chunk:
     metadata: dict = field(default_factory=dict)
     embedding: Optional[list[float]] = None
     parent: Optional['Chunk'] = None
-
-
-def _new_chunk(document: str, **metadata) -> Chunk:
-    """统一 Chunk 构造点：自动填充雪花 ID 作为 chunk_id"""
-    metadata['chunk_id'] = snow_flake.next_id()
-    return Chunk(document=document, metadata=metadata)
 
 
 class ChunkingStrategy(ABC):
@@ -61,6 +52,34 @@ class ChunkingStrategy(ABC):
         :param kwargs: 与各策略 __init__ 同名的可选参数
         """
         pass
+
+    @staticmethod
+    def _new_chunk(document: str, **metadata) -> Chunk:
+        """统一 Chunk 构造点：自动填充雪花 ID 作为 chunk_id"""
+        metadata['chunk_id'] = snow_flake.next_id()
+        return Chunk(document=document, metadata=metadata)
+
+    @staticmethod
+    def _split_keep_separator(text: str, separator: str) -> list[str]:
+        """按匹配末尾切片，分隔符留在前片；纯空白并入邻片，不丢失原文。"""
+        pieces = []
+        start = 0
+        for match in re.finditer(separator, text):
+            end = match.end()
+            piece = text[start:end]
+            if piece.strip():
+                pieces.append(piece)
+                start = end
+            elif pieces:
+                pieces[-1] += piece
+                start = end
+        tail = text[start:]
+        if tail:
+            if pieces and not tail.strip():
+                pieces[-1] += tail
+            else:
+                pieces.append(tail)
+        return pieces
 
 
 class FixedLengthChunking(ChunkingStrategy):
@@ -109,7 +128,7 @@ class FixedLengthChunking(ChunkingStrategy):
         step = self.chunk_size - self.overlap
         while start < text_len:
             end = start + self.chunk_size
-            chunks.append(_new_chunk(text[start:end]))
+            chunks.append(self._new_chunk(text[start:end]))
             if end >= text_len:
                 break
             start += step
@@ -202,22 +221,22 @@ class SemanticChunking(ChunkingStrategy):
         强边界切句（R1）：段落粗切 + 标点优先 + 换行兜底 + 缩写/小数保护
         - 先按段落分隔符 \\n\\s*\\n 取粗块（兼顾多段文章）
         - 粗块内有强标点则按强标点切句，无强标点才按换行切行（兜底无标点片段/标签/key-value）
-        - 切分前用占位符保护缩写/小数，切完后还原
+        - 切分前用占位符保护缩写/小数，切完后还原；保留分隔符和首尾空白
         """
         units = []
-        for block in re.split(r'\n\s*\n', text.strip()):
+        for block in self._split_keep_separator(text, r'\n\s*\n'):
             block = self._protect(block)
             if self._has_strong_punct(block):
-                sents = re.split(r'(?<=[。！？.!?…])\s*', block)
+                sents = self._split_keep_separator(block, r'(?<=[。！？.!?…])\s*')
             else:
                 # 无强标点的短行/标签/key-value，按换行兜底
-                sents = block.split('\n')
+                sents = self._split_keep_separator(block, '\n')
             units.extend(self._restore(s) for s in sents if s.strip())
         return units
 
     def _split_weak(self, text: str) -> list[str]:
         """弱边界切子单元：；：，等次级标点 + 换行，供超大块单句降级切分"""
-        return [s for s in re.split(r'(?<=[；;，,：:、])\s*|\n+', text) if s.strip()]
+        return self._split_keep_separator(text, r'(?<=[；;，,：:、])\s*|\n+')
 
     # ---------- 超大分片处理：语义优先二分 + 三层降级 ----------
 
@@ -288,15 +307,15 @@ class SemanticChunking(ChunkingStrategy):
         return result
 
     def split(self, text: str) -> list[Chunk]:
-        if not text:
+        if not text.strip():
             return []
         # 切分
         sentences = self._split_sentences(text)
-        if len(sentences) <= 1:
-            return [_new_chunk(text)] if text.strip() else []
+        if len(sentences) == 1 and len(text) <= self.max_chunk_size:
+            return [self._new_chunk(text)]
 
         # 批量计算所有句子的嵌入向量
-        embeddings = self.embed_fn.encode(sentences)
+        embeddings = self.embed_fn.encode([s.strip() for s in sentences])
 
         # 第一遍：相邻句相似度判定，低于阈值则断开；同时记录每个语义块对应的句子索引区间 [start, end)
         # 供 _split_oversized/_semantic_bisect 复用 embeddings，不重复编码
@@ -319,10 +338,10 @@ class SemanticChunking(ChunkingStrategy):
         result: list[Chunk] = []
         for chunk_text, start, end in chunks:
             if len(chunk_text) <= self.max_chunk_size:
-                result.append(_new_chunk(chunk_text))
+                result.append(self._new_chunk(chunk_text))
             else:
                 pieces = self._split_oversized(chunk_text, (start, end), embeddings, sentences)
-                result.extend(_new_chunk(p) for p in pieces)
+                result.extend(self._new_chunk(p) for p in pieces)
         return result
 
 
@@ -442,7 +461,7 @@ class RecursiveChunking(ChunkingStrategy):
         if not text:
             return []
         small_chunks = self._recursive_split(text)
-        return [_new_chunk(c) for c in self._merge_chunks(small_chunks)]
+        return [self._new_chunk(c) for c in self._merge_chunks(small_chunks)]
 
 
 class StructuralChunking(ChunkingStrategy):
@@ -542,12 +561,11 @@ class StructuralChunking(ChunkingStrategy):
     # ---------- 自实现递归切分（解耦 RecursiveChunking，分隔符针对解析 markdown） ----------
 
     def _split_by_separator(self, text: str, separator, chunk_size: int) -> list[str]:
-        """按单个分隔符切分文本，保留分隔产生的非空片段"""
+        """按单个分隔符切分文本，保留原始分隔符以便直接拼接"""
         if separator is None:
             # 定长兜底
             return [text[i:i + chunk_size] for i in range(0, len(text), chunk_size)]
-        pieces = re.split(separator, text)
-        return [p for p in pieces if p]
+        return self._split_keep_separator(text, separator)
 
     def _recursive_split(self, text: str, sep_idx: int = 0,
                          chunk_size: int = None) -> list[str]:
@@ -632,7 +650,7 @@ class StructuralChunking(ChunkingStrategy):
 
             # 标题路径变化时，若当前分块非空则收尾
             if path and path != content_path and current.strip():
-                chunks.append(_new_chunk(current, path=content_path))
+                chunks.append(self._new_chunk(current, path=content_path))
                 prev_tail = current[-self.overlap:] if self.overlap > 0 else ''
                 current = ''
 
@@ -648,7 +666,7 @@ class StructuralChunking(ChunkingStrategy):
                         content_path = path
                 else:
                     if current.strip():
-                        chunks.append(_new_chunk(current, path=content_path))
+                        chunks.append(self._new_chunk(current, path=content_path))
                         prev_tail = current[-self.overlap:] if self.overlap > 0 else ''
                     # overlap 取前一片尾部，置于 prefix 之后、content 之前，保证路径前缀始终在 chunk 头部
                     if self.overlap > 0 and prev_tail:
@@ -675,7 +693,7 @@ class StructuralChunking(ChunkingStrategy):
                             content_path = path
                     else:
                         if current.strip():
-                            chunks.append(_new_chunk(current, path=content_path))
+                            chunks.append(self._new_chunk(current, path=content_path))
                             prev_tail = current[-self.overlap:] if self.overlap > 0 else ''
                         if self.overlap > 0 and prev_tail:
                             overlap_piece = prefix + prev_tail + sc_text
@@ -688,7 +706,7 @@ class StructuralChunking(ChunkingStrategy):
                         content_path = path
 
         if current.strip():
-            chunks.append(_new_chunk(current, path=content_path))
+            chunks.append(self._new_chunk(current, path=content_path))
         return chunks
 
     def split(self, text: str) -> list[Chunk]:

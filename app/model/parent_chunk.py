@@ -22,6 +22,7 @@ class ParentChunk(dbs.Base):
     返回更完整的上下文（Parent Document Retrieval 思路）。
     """
     __tablename__ = 'parent_chunk'
+    __table_args__ = {'schema': 'rag_engine'}
 
     chunk_id = Column(BigInteger, primary_key=True, nullable=False, comment='雪花ID')
     document = Column(Text, comment='原文')

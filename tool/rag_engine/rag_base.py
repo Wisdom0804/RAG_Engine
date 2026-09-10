@@ -90,14 +90,14 @@ class RAGBase:
 
     async def _store_parents_pg(self, parents: list[Chunk]) -> None:
         """父块批量写入 PG parent_chunk 表"""
-        async with dbs.auto_commit() as session:
+        async with dbs.auto_commit() as db:
             for p in parents:
                 row = ParentChunk(
                     chunk_id=p.metadata['chunk_id'],
                     document=p.document,
                     metadata_=p.metadata,
                 )
-                session.add(row)
+                db.add(row)
 
     # ---------- 检索 ----------
     async def retrieve(self, query: str, top_k: int = 5,
