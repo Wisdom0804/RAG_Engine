@@ -21,3 +21,15 @@ class ChromaGetResponse(BaseModel):
     documents: list[str] | None = Field(default=None, description="文档内容列表，未 include 时为 None")
     embeddings: list[list[float]] | None = Field(default=None, description="向量列表，未 include 时为 None")
     metadatas: list[dict] | None = Field(default=None, description="元数据列表，未 include 时为 None")
+
+
+class ChromaQueryResponse(BaseModel):
+    """
+    ChromaBase.query 的响应，含 metadata 与距离，供 rerank 与 parent_id 溯源。
+    query 按 query_embeddings 检索，ChromaDB 原始返回各字段均为外层 list[list]，
+    此处只取第一组（单条 query）的结果展平为一维。
+    """
+    ids: list[str] = Field(..., description="命中的记录 ID 列表")
+    documents: list[str] = Field(..., description="命中的文档内容列表")
+    metadatas: list[dict] = Field(..., description="命中的元数据列表，供 parent_id 溯源")
+    distances: list[float] = Field(..., description="命中的距离分数列表，越小越相似")
