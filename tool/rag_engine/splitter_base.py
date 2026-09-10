@@ -912,8 +912,8 @@ if __name__ == '__main__':
               f"所属父块: {parent.document!r}")
 
     # 5.2 父/子均用递归切分（配置不同），需各自独立实例，不复用缓存
-    parent_splitter2 = SplitterFactory.create_strategy('recursive', chunk_size=60, overlap=20)
-    child_splitter2 = SplitterFactory.create_strategy('recursive', chunk_size=32, overlap=10)
+    parent_splitter2 = SplitterFactory.create_strategy(ChunkingStrategyEnum.递归切分.value, chunk_size=60, overlap=20)
+    child_splitter2 = SplitterFactory.create_strategy(ChunkingStrategyEnum.递归切分.value, chunk_size=32, overlap=10)
     text_splitter.set_strategy(
         ChunkingStrategyEnum.父子切分.value,
         parent_splitter=parent_splitter2, child_splitter=child_splitter2,
