@@ -17,12 +17,9 @@ from sentence_transformers import CrossEncoder, SentenceTransformer
 
 from app.config.security import secure
 
-# 阿里华北2（北京）地域的 maas 入口（与 TPA/ALi/qwen 测试脚本一致）
-dashscope.base_http_api_url = "https://llm-udh4a0m8ljmmeirn.cn-beijing.maas.aliyuncs.com/api/v1"
+# 阿里 maas 入口（base_url 走 secure.QWEN_API_BASE 配置）
+dashscope.base_http_api_url = secure.QWEN_API_BASE
 
-# 阿里 qwen3.7 系列模型名
-_QWEN_EMBED_MODEL = "qwen3.7-text-embedding-flash"
-_QWEN_RERANK_MODEL = "qwen3.7-text-rerank"
 # qwen text-embedding 单次最多 20 条
 _QWEN_EMBED_BATCH = 20
 # 指定向量维度（仅 qwen3.7-text-embedding / v3 / v4 支持）
@@ -33,8 +30,8 @@ class ModelHub:
     """
     模型接入中心：统一管理嵌入与重排模型，本地/API 双轨可切。
 
-    - 嵌入默认本地 BAAI/bge-small-zh-v1.5，secure.EMBEDDING_NAME 命中 qwen 前缀则走 API
-    - 重排默认本地 cross-encoder/ms-marco-MiniLM-L6-v2，secure.RERANK_NAME 命中 qwen 前缀则走 API
+    - 嵌入模型名取 secure.EMBEDDING_NAME，命中 qwen 前缀走 API，否则本地 SentenceTransformer
+    - 重排模型名取 secure.RERANK_NAME，命中 qwen 前缀走 API，否则本地 CrossEncoder
     - embed_fn 属性供 SemanticChunking.configure(embed_fn=...) 注入复用同一 bge 实例（仅本地模式）
     """
 
@@ -49,14 +46,14 @@ class ModelHub:
 
     # ---------- 嵌入 ----------
     def _init_embedder(self):
-        name = getattr(secure, 'EMBEDDING_NAME', '') or ''
+        name = secure.QWEN_EMBEDDING_NAME or ''
         if name.lower().startswith(self._QWEN_MARK):
             self._embed_mode = 'api'
             self._embed_model_name = name
         else:
             self._embed_mode = 'local'
-            self._embedder = SentenceTransformer("BAAI/bge-small-zh-v1.5")
-            self._embed_model_name = "BAAI/bge-small-zh-v1.5"
+            self._embedder = SentenceTransformer(name)
+            self._embed_model_name = name
 
     async def embed(self, texts: list[str]) -> list[list[float]]:
         """
@@ -76,7 +73,7 @@ class ModelHub:
             resp = await asyncio.to_thread(
                 dashscope.TextEmbedding.call,
                 api_key=secure.QWEN_API_KEY,
-                model=_QWEN_EMBED_MODEL,
+                model=self._embed_model_name,
                 input=batch,
                 dimension=_QWEN_EMBED_DIMENSION,
                 text_type="document",  # 入库/聚类/分类用 document，检索 query 用 query
@@ -97,7 +94,7 @@ class ModelHub:
         resp = await asyncio.to_thread(
             dashscope.TextEmbedding.call,
             api_key=secure.QWEN_API_KEY,
-            model=_QWEN_EMBED_MODEL,
+            model=self._embed_model_name,
             input=text,
             dimension=_QWEN_EMBED_DIMENSION,
             text_type="query",
@@ -116,14 +113,14 @@ class ModelHub:
 
     # ---------- 重排 ----------
     def _init_reranker(self):
-        name = getattr(secure, 'RERANK_NAME', '') or ''
+        name = secure.QWEN_RERANK_NAME or ''
         if name.lower().startswith(self._QWEN_MARK):
             self._rerank_mode = 'api'
             self._rerank_model_name = name
         else:
             self._rerank_mode = 'local'
-            self._reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L6-v2")
-            self._rerank_model_name = "cross-encoder/ms-marco-MiniLM-L6-v2"
+            self._reranker = CrossEncoder(name)
+            self._rerank_model_name = name
 
     async def rerank(self, query: str, docs: list[str], top_k: int) -> list[tuple[str, float]]:
         """
@@ -141,7 +138,7 @@ class ModelHub:
         resp = await asyncio.to_thread(
             dashscope.TextReRank.call,
             api_key=secure.QWEN_API_KEY,
-            model=_QWEN_RERANK_MODEL,
+            model=self._rerank_model_name,
             query=query,
             documents=docs,
             top_n=top_k,

@@ -34,8 +34,8 @@ class Secure(BaseSettings):
     # 阿里模型
     QWEN_API_KEY:str
     QWEN_API_BASE:str
-    EMBEDDING_NAME:str
-    RERANK_NAME:str
+    QWEN_EMBEDDING_NAME:str
+    QWEN_RERANK_NAME:str
 
 
     # 使用 Pydantic v2 的配置方式
