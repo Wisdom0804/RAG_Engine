@@ -120,22 +120,24 @@ class SemanticChunking(ChunkingStrategy):
     """
     语义切分策略
     不固定分块大小，通过嵌入函数计算相邻句子的相似度，相似度低于阈值时断开形成新分块
-    默认嵌入模型需要科学上网，自定义嵌入方法需要重写encode方法
-    通过 max_chunk_size 限制最大分片大小，防止语义高度连贯时产生超大分片
+    默认嵌入模型 BAAI/bge-small-zh-v1.5（中文小模型，约 95MB），自定义嵌入方法需重写 encode 方法
+    通过 max_chunk_size 限制最大分片大小，防止语义高度连贯时产生超大分片，超大分片按三层降级切分
     """
 
     def __init__(self, embed_fn=None, threshold: float = 0.51, max_chunk_size: int = 1000):
         """
         :param embed_fn: 嵌入函数/模型，需支持 encode(list[str]) -> ndarray，
-                         默认使用 SentenceTransformer("all-MiniLM-L6-v2")
+                         默认使用 SentenceTransformer("BAAI/bge-small-zh-v1.5")（中文小模型，约 95MB）
         :param threshold: 相似度阈值，低于该值则断开，取值范围 [0, 1]
-        :param max_chunk_size: 单个分块的最大字符长度，超过则按句子进一步切分（句子仍超长则定长兜底）
+        :param max_chunk_size: 单个分块的最大字符长度，超过则按三层降级切分（语义二分 → 弱边界 → 定长兜底）
         """
         if embed_fn is None:
-            embed_fn = SentenceTransformer("all-MiniLM-L6-v2")
+            embed_fn = SentenceTransformer("BAAI/bge-small-zh-v1.5")
         self.embed_fn = embed_fn
         self.threshold = threshold
         self.max_chunk_size = max_chunk_size
+        # 缩写/小数白名单占位保护映射，_protect 写入、_restore 读取（按 block 生命周期清理）
+        self._protect_map: dict[str, str] = {}
         self._validate()
 
     def configure(self, *, embed_fn=None, threshold: float = None, max_chunk_size: int = None) -> None:
@@ -160,44 +162,130 @@ class SemanticChunking(ChunkingStrategy):
         if self.max_chunk_size <= 0:
             raise ValueError("max_chunk_size 必须大于 0")
 
+    # ---------- 句子切分：强边界 R1（标点优先 + 换行兜底 + 缩写/小数保护） ----------
+
+    # 需要保护的"看起来像句子结束标点、但实际不是"的模式：
+    #   小数（3.14）、多字母缩写（U.S.A. / e.g.）、常见单缩写（Dr. / Mr. / etc.）
+    _PROTECT_PATTERN = re.compile(
+        r'\d+\.\d+'                                  # 小数：3.14 / 0.5
+        r'|(?:[A-Za-z]\.){2,}'                       # 多字母缩写：U.S.A. / e.g. / i.e.
+        r'|\b(?:Mr|Mrs|Dr|Ms|Prof|Jr|Sr|St|vs|etc)\.'  # 常见单缩写：Dr. / Mr. / etc.
+    )
+
+    def _protect(self, text: str) -> str:
+        """用占位符保护缩写/小数，防止被强标点误切；占位映射存入 self._protect_map"""
+        self._protect_map.clear()
+        counter = 0
+
+        def _sub(m):
+            nonlocal counter
+            placeholder = f'\x00PROT{counter}\x00'
+            counter += 1
+            self._protect_map[placeholder] = m.group()
+            return placeholder
+
+        return self._PROTECT_PATTERN.sub(_sub, text)
+
+    def _restore(self, text: str) -> str:
+        """还原 _protect 保护的缩写/小数"""
+        for placeholder, original in self._protect_map.items():
+            text = text.replace(placeholder, original)
+        return text
+
+    @staticmethod
+    def _has_strong_punct(text: str) -> bool:
+        """判断文本是否含强标点（。！？.!?…）"""
+        return bool(re.search(r'[。！？.!?…]', text))
+
     def _split_sentences(self, text: str) -> list[str]:
-        """将文本切分为句子列表"""
-        sentences = re.split(r'(?<=[。！？.!?])\s*', text.strip())
-        return [s for s in sentences if s.strip()]
+        """
+        强边界切句（R1）：段落粗切 + 标点优先 + 换行兜底 + 缩写/小数保护
+        - 先按段落分隔符 \\n\\s*\\n 取粗块（兼顾多段文章）
+        - 粗块内有强标点则按强标点切句，无强标点才按换行切行（兜底无标点片段/标签/key-value）
+        - 切分前用占位符保护缩写/小数，切完后还原
+        """
+        units = []
+        for block in re.split(r'\n\s*\n', text.strip()):
+            block = self._protect(block)
+            if self._has_strong_punct(block):
+                sents = re.split(r'(?<=[。！？.!?…])\s*', block)
+            else:
+                # 无强标点的短行/标签/key-value，按换行兜底
+                sents = block.split('\n')
+            units.extend(self._restore(s) for s in sents if s.strip())
+        return units
+
+    def _split_weak(self, text: str) -> list[str]:
+        """弱边界切子单元：；：，等次级标点 + 换行，供超大块单句降级切分"""
+        return [s for s in re.split(r'(?<=[；;，,：:、])\s*|\n+', text) if s.strip()]
+
+    # ---------- 超大分片处理：语义优先二分 + 三层降级 ----------
+
+    def _semantic_bisect(self, sent_range: tuple[int, int],
+                         embeddings: np.ndarray, sentences: list[str]) -> list[str]:
+        """
+        语义优先二分：在 [start, end) 内找最低相似度相邻对切开，递归。
+        复用第一遍已算的 embeddings，不重复编码；断点选在语义最弱处，与"语义切分"立意一致。
+        终止条件：片段长度 ≤ max_chunk_size 或只剩单句（单句超长交由上层降级）。
+        """
+        start, end = sent_range
+        current_text = ''.join(sentences[start:end])
+        # 长度达标 或 只剩单句（单句超长交由 _split_oversized 降级）
+        if len(current_text) <= self.max_chunk_size or end - start <= 1:
+            return [current_text]
+        # 块内相邻对 (i, i+1)，相似度已算
+        sims = [(self._cosine_similarity(embeddings[i], embeddings[i + 1]), i)
+                for i in range(start, end - 1)]
+        # 最低相似度处断
+        _, cut = min(sims, key=lambda x: x[0])
+        left = self._semantic_bisect((start, cut + 1), embeddings, sentences)
+        right = self._semantic_bisect((cut + 1, end), embeddings, sentences)
+        return left + right
 
     @staticmethod
     def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
         """计算两个向量的余弦相似度"""
         return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-10))
 
-    def _split_oversized(self, text: str) -> list[str]:
+    def _split_oversized(self, text: str, sent_range: tuple[int, int],
+                         embeddings: np.ndarray, sentences: list[str]) -> list[str]:
         """
-        对超大分片按句子切分后逐句拼接以逼近 max_chunk_size，
-        单句仍超长时用定长切分兜底
+        超大分片三层降级（语义优先二分，复用第一遍 embeddings）：
+        1. 语义二分：在块内最低相似度相邻对处切开，递归至 ≤ max_chunk_size 或只剩单句
+        2. 弱边界：单句超长时按 ；：， 等次级标点切，贪心拼接逼近 max_chunk_size
+        3. 定长兜底：弱边界切不动时按 max_chunk_size 硬切
         """
-        sentences = self._split_sentences(text)
-        if not sentences:
-            return []
-        chunks = []
-        current = ''
-        for sent in sentences:
-            if len(sent) > self.max_chunk_size:
-                # 先收尾当前累积内容
-                if current:
-                    chunks.append(current)
-                    current = ''
-                # 单句超长，定长切分兜底
-                for i in range(0, len(sent), self.max_chunk_size):
-                    chunks.append(sent[i:i + self.max_chunk_size])
-            elif len(current) + len(sent) <= self.max_chunk_size:
-                current += sent
-            else:
-                if current:
-                    chunks.append(current)
-                current = sent
-        if current:
-            chunks.append(current)
-        return chunks
+        pieces = self._semantic_bisect(sent_range, embeddings, sentences)
+        result = []
+        for piece in pieces:
+            if len(piece) <= self.max_chunk_size:
+                result.append(piece)
+                continue
+            # 单句超长 → 弱边界贪心拼接
+            sub_units = self._split_weak(piece)
+            if len(sub_units) <= 1:
+                # 弱边界切不动，定长兜底
+                result.extend(piece[i:i + self.max_chunk_size]
+                               for i in range(0, len(piece), self.max_chunk_size))
+                continue
+            current = ''
+            for unit in sub_units:
+                if len(unit) > self.max_chunk_size:
+                    # 子单元仍超长，定长兜底
+                    if current:
+                        result.append(current)
+                        current = ''
+                    result.extend(unit[i:i + self.max_chunk_size]
+                                   for i in range(0, len(unit), self.max_chunk_size))
+                elif len(current) + len(unit) <= self.max_chunk_size:
+                    current += unit
+                else:
+                    if current:
+                        result.append(current)
+                    current = unit
+            if current:
+                result.append(current)
+        return result
 
     def split(self, text: str) -> list[Chunk]:
         if not text:
@@ -210,24 +298,31 @@ class SemanticChunking(ChunkingStrategy):
         # 批量计算所有句子的嵌入向量
         embeddings = self.embed_fn.encode(sentences)
 
-        chunks = []
+        # 第一遍：相邻句相似度判定，低于阈值则断开；同时记录每个语义块对应的句子索引区间 [start, end)
+        # 供 _split_oversized/_semantic_bisect 复用 embeddings，不重复编码
+        chunks = []  # list[(text, start_idx, end_idx)]
+        current_start = 0
         current = [sentences[0]]
         for i in range(1, len(sentences)):
             sim = self._cosine_similarity(embeddings[i - 1], embeddings[i])
             if sim < self.threshold:
                 # 相似度低于阈值，断开形成新分块
-                chunks.append(''.join(current))
+                chunks.append((''.join(current), current_start, i))
                 current = [sentences[i]]
+                current_start = i
             else:
                 current.append(sentences[i])
         if current:
-            chunks.append(''.join(current))
+            chunks.append((''.join(current), current_start, len(sentences)))
 
         # 限制最大分片大小，防止语义连贯产生超大分片；统一包装为 Chunk
         result: list[Chunk] = []
-        for chunk in chunks:
-            pieces = self._split_oversized(chunk) if len(chunk) > self.max_chunk_size else [chunk]
-            result.extend(_new_chunk(p) for p in pieces)
+        for chunk_text, start, end in chunks:
+            if len(chunk_text) <= self.max_chunk_size:
+                result.append(_new_chunk(chunk_text))
+            else:
+                pieces = self._split_oversized(chunk_text, (start, end), embeddings, sentences)
+                result.extend(_new_chunk(p) for p in pieces)
         return result
 
 
@@ -353,50 +448,53 @@ class RecursiveChunking(ChunkingStrategy):
 class StructuralChunking(ChunkingStrategy):
     """
     结构切分策略
-    接收文档解析后的文本，按文档类型（markdown / html / docx / code）识别结构单元，
+    接收文档解析后的 markdown 文本，识别标题层级与标题下内容块等结构单元，
     在结构内部递归切分，并在 chunk 头部保留标题路径等元数据，相邻分块保留 overlap。
-    单个结构单元超长时，借助 RecursiveChunking 在结构内进一步切分。
+    单个结构单元超长时，在结构内用自实现的递归切分进一步切分（不依赖兄弟策略 RecursiveChunking）。
     """
 
-    def __init__(self, chunk_size: int = 500, overlap: int = 50, doc_type: str = 'markdown'):
+    # 针对解析 markdown（PDF/Excel/Docx 解析产物：缺标点、多换行）优化的分隔符序列，粒度由粗到细
+    # 与 RecursiveChunking.DEFAULT_SEPARATORS 的区别：去空格层、加列表项边界、加表格单元格兜底、标点降级
+    STRUCTURAL_SEPARATORS = [
+        '\n\n',                                    # 段落（空行分隔）
+        r'\n(?=\s*[-*+]\s|\s*\d+[.)]\s)',          # 列表项边界（换行+列表标记）
+        '\n',                                      # 换行（markdown 行级单元，含表格行）
+        r'(?<=[。！？.!?…])',                       # 句子标点（有则切，兜底）
+        r'(?<=[,，;；:：、])',                      # 次级标点（进一步兜底）
+        r'\|',                                     # 表格单元格（最后兜底，行超长才用）
+        None,                                      # 定长兜底
+    ]
+
+    def __init__(self, chunk_size: int = 500, overlap: int = 50):
         """
         :param chunk_size: 每个分块的目标/最大字符长度
         :param overlap: 相邻分块间的重叠字符长度
-        :param doc_type: 文档类型，可选 'markdown' / 'html' / 'docx' / 'code'
         """
         self.chunk_size = chunk_size
         self.overlap = overlap
-        self.doc_type = doc_type
-        self._recursive = RecursiveChunking(chunk_size=chunk_size, overlap=overlap)
+        self.separators = list(self.STRUCTURAL_SEPARATORS)
         self._validate()
 
     def _validate(self) -> None:
-        """原子校验 chunk_size、overlap 与 doc_type"""
+        """原子校验 chunk_size 与 overlap"""
         if self.chunk_size <= 0:
             raise ValueError("chunk_size 必须大于 0")
         if self.overlap < 0 or self.overlap >= self.chunk_size:
             raise ValueError(f"overlap 必须在 [0, {self.chunk_size}) 之间")
-        if self.doc_type not in ('markdown', 'html', 'docx', 'code'):
-            raise ValueError(f"不支持的文档类型 '{self.doc_type}'，可选: markdown/html/docx/code")
 
-    def configure(self, *, chunk_size: int = None, overlap: int = None, doc_type: str = None) -> None:
+    def configure(self, *, chunk_size: int = None, overlap: int = None) -> None:
         """
         批量设置构造参数，未传入的不修改
         :param chunk_size: 每个分块的目标/最大字符长度
         :param overlap: 相邻分块间的重叠字符长度
-        :param doc_type: 文档类型
         """
         if chunk_size is not None:
             self.chunk_size = chunk_size
         if overlap is not None:
             self.overlap = overlap
-        if doc_type is not None:
-            self.doc_type = doc_type
-        # 同步内部递归切分器参数
-        self._recursive.configure(chunk_size=self.chunk_size, overlap=self.overlap)
         self._validate()
 
-    # ---------- 各类型结构单元识别 ----------
+    # ---------- markdown 结构单元识别 ----------
 
     def _parse_markdown(self, text: str) -> list[dict]:
         """
@@ -429,109 +527,86 @@ class StructuralChunking(ChunkingStrategy):
         flush_content()
         return units
 
-    def _parse_html(self, text: str) -> list[dict]:
-        """
-        识别 html 结构单元：h1~h6 标题与 p/div/section/li 等正文块。
-        按文档顺序遍历标题与正文块，正文归入其前序最近标题路径下。
-        """
-        units = []
-        title_stack = []  # [(level, title), ...]
+    # ---------- 解析噪声清洗 ----------
 
-        # 单次扫描：同时匹配标题与正文块，按出现顺序处理，保证正文归入前序标题
-        token_re = re.compile(
-            r'<(h[1-6])[^>]*>(.*?)</\1>|<(p|div|section|li)[^>]*>(.*?)</\3>',
-            flags=re.IGNORECASE | re.DOTALL,
-        )
-        for m in token_re.finditer(text):
-            if m.group(1):  # 标题：仅更新标题路径，不作为内容单元
-                level = int(m.group(1)[-1])
-                title = re.sub(r'<[^>]+>', '', m.group(2)).strip()
-                while title_stack and title_stack[-1][0] >= level:
-                    title_stack.pop()
-                title_stack.append((level, title))
-            else:  # 正文块
-                inner = re.sub(r'<[^>]+>', '', m.group(4)).strip()
-                if inner:
-                    path = ' > '.join(t for _, t in title_stack)
-                    units.append({'path': path, 'content': inner})
-        return units
-
-    def _parse_docx(self, text: str) -> list[dict]:
+    def _clean_noise(self, text: str) -> str:
         """
-        识别 docx 解析后的结构单元。
-        约定解析输出中以形如「# 标题」「Heading 1: 标题」的行作为标题，
-        其余行按段落归入当前标题下。
+        清洗解析噪声：NaN 空值、Unnamed 空表头。
+        只清空内容不删列：NaN/Unnamed: N 替换为空字符串，保持表格 | 结构完整；
+        不清理空行/空列，避免破坏表格结构（空行在段落粗切时自然过滤）。
         """
-        units = []
-        title_stack = []
-        content_lines = []
+        text = re.sub(r'\bNaN\b', '', text)           # Excel 空值
+        text = re.sub(r'Unnamed:\s*\d+', '', text)    # Excel 空表头
+        return text
 
-        def flush_content():
-            if content_lines:
-                path = ' > '.join(title_stack)
-                units.append({'path': path, 'content': '\n'.join(content_lines).rstrip('\n')})
-                content_lines.clear()
+    # ---------- 自实现递归切分（解耦 RecursiveChunking，分隔符针对解析 markdown） ----------
 
-        for line in text.split('\n'):
-            # 兼容 markdown 风格「# 标题」与「Heading N: 标题」风格
-            md_m = re.match(r'^(#{1,6})\s+(.+?)\s*$', line)
-            hd_m = re.match(r'^Heading\s*([1-6])\s*[:：]\s*(.+?)\s*$', line, flags=re.IGNORECASE)
-            if md_m:
-                level, title = len(md_m.group(1)), md_m.group(2)
-            elif hd_m:
-                level, title = int(hd_m.group(1)), hd_m.group(2)
+    def _split_by_separator(self, text: str, separator, chunk_size: int) -> list[str]:
+        """按单个分隔符切分文本，保留分隔产生的非空片段"""
+        if separator is None:
+            # 定长兜底
+            return [text[i:i + chunk_size] for i in range(0, len(text), chunk_size)]
+        pieces = re.split(separator, text)
+        return [p for p in pieces if p]
+
+    def _recursive_split(self, text: str, sep_idx: int = 0,
+                         chunk_size: int = None) -> list[str]:
+        """
+        按分隔符层级递归切分，直到每片 ≤ chunk_size。
+        用 STRUCTURAL_SEPARATORS，针对解析 markdown 优化。
+        若当前分隔符切不动（仍只有一个片段且超长），则换更细的分隔符继续。
+        """
+        chunk_size = self.chunk_size if chunk_size is None else chunk_size
+        if len(text) <= chunk_size:
+            return [text] if text else []
+        if sep_idx >= len(self.separators):
+            # 全部分隔符都已尝试，定长兜底
+            return [text[i:i + chunk_size] for i in range(0, len(text), chunk_size)]
+
+        separator = self.separators[sep_idx]
+        pieces = self._split_by_separator(text, separator, chunk_size)
+        # 当前分隔符切不动，换更细的分隔符
+        if len(pieces) <= 1:
+            return self._recursive_split(text, sep_idx + 1, chunk_size)
+
+        result = []
+        for piece in pieces:
+            if len(piece) > chunk_size:
+                # 该片段仍超长，递归用更细的分隔符
+                result.extend(self._recursive_split(piece, sep_idx + 1, chunk_size))
             else:
-                level, title = None, None
+                result.append(piece)
+        return result
 
-            if level is not None:
-                flush_content()
-                # 弹出同级及更深层标题，维持层级栈深度
-                while title_stack and len(title_stack) >= level:
-                    title_stack.pop()
-                title_stack.append(title)
+    def _merge_chunks(self, chunks: list[str], chunk_size: int = None,
+                      overlap: int = None) -> list[str]:
+        """将小分片拼接以逼近 chunk_size，相邻分块以 overlap 衔接"""
+        chunk_size = self.chunk_size if chunk_size is None else chunk_size
+        overlap = self.overlap if overlap is None else overlap
+        if not chunks:
+            return []
+        merged = []
+        current = ''
+        for chunk in chunks:
+            if not current:
+                current = chunk
+            elif len(current) + len(chunk) <= chunk_size:
+                current += chunk
             else:
-                content_lines.append(line)
-        flush_content()
-        return units
-
-    def _parse_code(self, text: str) -> list[dict]:
-        """
-        识别代码结构单元：函数/类/方法定义作为分界，块内为正文。
-        以缩进推断层级：同级缩进的定义为兄弟（平铺），更深缩进为子定义。
-        兼容 Python(def/class)、JS/TS(function/class/export) 等常见定义。
-        def/class 行与其后续函数体行合并为同一结构单元，避免签名与实现被拆开。
-        """
-        units = []
-        title_stack = []  # [(indent, name), ...]
-        current_lines = []
-
-        def flush_content():
-            if current_lines:
-                path = ' > '.join(n for _, n in title_stack)
-                units.append({'path': path, 'content': '\n'.join(current_lines)})
-                current_lines.clear()
-
-        # 函数/类/方法定义行：捕获前导空白（缩进）与定义名
-        define_re = re.compile(
-            r'^(\s*)(?:export\s+)?(?:async\s+)?(?:def|function|class)\s+(\w+)',
-            re.MULTILINE,
-        )
-        for line in text.split('\n'):
-            m = define_re.match(line)
-            if m:
-                flush_content()
-                indent = len(m.group(1))
-                name = m.group(2)
-                # 弹出同级及更深缩进的定义，维持层级栈
-                while title_stack and title_stack[-1][0] >= indent:
-                    title_stack.pop()
-                title_stack.append((indent, name))
-                # def/class 行作为新单元的第一行，函数体后续累积到同一单元
-                current_lines.append(line)
-            else:
-                current_lines.append(line)
-        flush_content()
-        return units
+                # 当前累积已达上限，收尾并开启新分块
+                merged.append(current)
+                if overlap > 0:
+                    tail = current[-overlap:]
+                    # overlap + chunk 仍在上限内则带上 overlap
+                    if len(tail) + len(chunk) <= chunk_size:
+                        current = tail + chunk
+                    else:
+                        current = chunk
+                else:
+                    current = chunk
+        if current:
+            merged.append(current)
+        return merged
 
     # ---------- chunk 组装 ----------
 
@@ -539,7 +614,7 @@ class StructuralChunking(ChunkingStrategy):
         """
         在结构内部递归切分并组装 chunk：
         - 在 chunk 头部保留标题路径元数据 [path]，并写入 metadata['path']
-        - 单个结构单元超长时用 RecursiveChunking 在结构内继续切分
+        - 单个结构单元超长时用自实现的 _recursive_split + _merge_chunks 在结构内继续切分
         - 相邻分块保留 overlap（取自前一 chunk 的正文尾部）
         """
         chunks: list[Chunk] = []
@@ -575,9 +650,8 @@ class StructuralChunking(ChunkingStrategy):
                     if current.strip():
                         chunks.append(_new_chunk(current, path=content_path))
                         prev_tail = current[-self.overlap:] if self.overlap > 0 else ''
-                    # overlap 衔接（代码切分禁用 char-level overlap）
                     # overlap 取前一片尾部，置于 prefix 之后、content 之前，保证路径前缀始终在 chunk 头部
-                    if self.overlap > 0 and self.doc_type != 'code' and prev_tail:
+                    if self.overlap > 0 and prev_tail:
                         overlap_piece = prefix + prev_tail + content
                         if len(overlap_piece) <= self.chunk_size:
                             current = overlap_piece
@@ -587,20 +661,11 @@ class StructuralChunking(ChunkingStrategy):
                         current = piece
                     content_path = path
             else:
-                # 单个结构单元超长，在结构内递归切分
-                if self.doc_type == 'code':
-                    target_size = self.chunk_size
-                else:
-                    target_size = max(1, self.chunk_size - len(prefix))
-                saved_size = self._recursive.chunk_size
-                saved_overlap = self._recursive.overlap
-                self._recursive.configure(chunk_size=target_size, overlap=0)
-                try:
-                    sub_chunks = self._recursive.split(content)
-                finally:
-                    self._recursive.configure(chunk_size=saved_size, overlap=saved_overlap)
-                for sc in sub_chunks:
-                    sc_text = sc.document
+                # 单个结构单元超长，在结构内自实现递归切分（不依赖 RecursiveChunking，无临时改配置再还原）
+                target_size = max(1, self.chunk_size - len(prefix))
+                sub_pieces = self._recursive_split(content, chunk_size=target_size)
+                sub_chunks = self._merge_chunks(sub_pieces, chunk_size=target_size, overlap=0)
+                for sc_text in sub_chunks:
                     sc_piece = prefix + sc_text
                     if len(current) + len(sc_piece) + (1 if current else 0) <= self.chunk_size:
                         if current:
@@ -612,7 +677,7 @@ class StructuralChunking(ChunkingStrategy):
                         if current.strip():
                             chunks.append(_new_chunk(current, path=content_path))
                             prev_tail = current[-self.overlap:] if self.overlap > 0 else ''
-                        if self.overlap > 0 and self.doc_type != 'code' and prev_tail:
+                        if self.overlap > 0 and prev_tail:
                             overlap_piece = prefix + prev_tail + sc_text
                             if len(overlap_piece) <= self.chunk_size:
                                 current = overlap_piece
@@ -629,16 +694,9 @@ class StructuralChunking(ChunkingStrategy):
     def split(self, text: str) -> list[Chunk]:
         if not text:
             return []
-        if self.doc_type == 'markdown':
-            units = self._parse_markdown(text)
-        elif self.doc_type == 'html':
-            units = self._parse_html(text)
-        elif self.doc_type == 'docx':
-            units = self._parse_docx(text)
-        elif self.doc_type == 'code':
-            units = self._parse_code(text)
-        else:
-            raise ValueError(f"不支持的文档类型: {self.doc_type}")
+        # 入口处清洗解析噪声（NaN 空值、Unnamed 空表头），_parse_markdown 与切分均用清洗后的文本
+        text = self._clean_noise(text)
+        units = self._parse_markdown(text)
         return self._build_chunks(units)
 
 
@@ -820,8 +878,7 @@ if __name__ == '__main__':
     for i, chunk in enumerate(text_splitter.split(recursive_sample)):
         print(f"  chunk{i}({len(chunk.document)}字符, id={chunk.metadata['chunk_id']}): {chunk.document!r}")
 
-    # 4. 结构切分：按文档类型识别结构单元，chunk 头部保留标题路径，结构内递归切分 + overlap
-    # 4.1 markdown
+    # 4. 结构切分：识别 markdown 标题层级与标题下内容块，chunk 头部保留标题路径，结构内递归切分 + overlap
     md_sample = (
         "# RAG 引擎\n"
         "RAG 结合检索与生成，缓解大模型幻觉。\n"
@@ -831,97 +888,55 @@ if __name__ == '__main__':
         "## 文档切分\n"
         "切分策略包括定长、语义、递归、结构切分，需根据文档类型选择合适的策略。"
     )
-    text_splitter.set_strategy(ChunkingStrategyEnum.结构切分.value, chunk_size=60, overlap=10, doc_type='markdown')
+    text_splitter.set_strategy(ChunkingStrategyEnum.结构切分.value, chunk_size=60, overlap=10)
     print("\n【结构切分-markdown】")
     for i, chunk in enumerate(text_splitter.split(md_sample)):
         print(f"  chunk{i}({len(chunk.document)}字符, path={chunk.metadata.get('path')!r}): {chunk.document!r}")
-
-    # 4.2 html
-    html_sample = (
-        "<h1>机器学习入门</h1>"
-        "<p>机器学习是让计算机从数据中学习规律的技术，分为监督学习与无监督学习。</p>"
-        "<h2>监督学习</h2>"
-        "<p>监督学习使用带标签数据训练模型，常见任务有分类与回归。</p>"
-        "<h2>无监督学习</h2>"
-        "<p>无监督学习从无标签数据中发现模式，如聚类与降维。</p>"
-    )
-    text_splitter.set_strategy(ChunkingStrategyEnum.结构切分.value, chunk_size=60, overlap=10, doc_type='html')
-    print("\n【结构切分-html】")
-    for i, chunk in enumerate(text_splitter.split(html_sample)):
-        print(f"  chunk{i}({len(chunk.document)}字符, path={chunk.metadata.get('path')!r}): {chunk.document!r}")
-
-    # 4.3 docx（解析后以「Heading N: 标题」标记层级）
-    docx_sample = (
-        "Heading 1: 项目概述\n"
-        "本项目实现一个轻量级 RAG 引擎，包含解析、切分、入库、检索、生成模块。\n"
-        "Heading 2: 核心模块\n"
-        "切分模块支持多种策略，可按文档类型选择最优方案。\n"
-        "Heading 2: 扩展模块\n"
-        "向量库基于 chromadb，支持持久化与内存两种模式。\n"
-    )
-    text_splitter.set_strategy(ChunkingStrategyEnum.结构切分.value, chunk_size=60, overlap=10, doc_type='docx')
-    print("\n【结构切分-docx】")
-    for i, chunk in enumerate(text_splitter.split(docx_sample)):
-        print(f"  chunk{i}({len(chunk.document)}字符, path={chunk.metadata.get('path')!r}): {chunk.document!r}")
-
-    # 4.4 代码
-    code_sample = (
-        "class RAGEngine:\n"
-        "    def __init__(self, splitter=None):\n"
-        "        self.splitter = splitter or TextSplitter()\n\n"
-        "    def ingest(self, text):\n"
-        "        chunks = self.splitter.split(text)\n"
-        "        return chunks\n"
-    )
-    text_splitter.set_strategy(ChunkingStrategyEnum.结构切分.value, chunk_size=60, overlap=10, doc_type='code')
-    print("\n【结构切分-code】")
-    for i, chunk in enumerate(text_splitter.split(code_sample)):
-        print(f"  chunk{i}({len(chunk.document)}字符, path={chunk.metadata.get('path')!r}): {chunk.document!r}")
-
-    # 5. 父子切分：先切较大的父块，再对每个父块切较小的子块（依赖注入）
-    parent_child_sample = (
-        "人工智能是计算机科学的一个分支，旨在让机器模拟人类智能。\n"
-        "机器学习通过大量数据训练模型，使计算机具备自动学习规律的能力。\n"
-        "深度学习利用多层神经网络进行特征提取，是机器学习的重要子领域。\n"
-        "大语言模型在海量文本上预训练，能够完成翻译、问答、摘要等生成任务。\n\n"
-        "火锅起源于川渝地区，以麻辣鲜香著称，是中国最具代表性的美食之一。\n"
-        "粤式早茶讲究精细，虾饺、烧卖、肠粉等都是经典茶点。\n"
-        "江浙菜口味偏甜，擅长清蒸与红烧，代表菜品有西湖醋鱼、东坡肉。\n\n"
-        "量子力学研究微观世界的运动规律，与相对论并称现代物理两大支柱。\n"
-        "薛定谔方程描述量子态演化，海森堡不确定性原理揭示了测量的极限。\n"
-        "量子纠缠等奇特现象正在推动量子计算与量子通信技术的发展。\n"
-    )
-
-    # 5.1 通过 get_cached_strategy 复用缓存中的切分器，或走工厂新建
-    text_splitter.set_strategy(ChunkingStrategyEnum.递归切分.value, chunk_size=60, overlap=20)
-    parent_splitter = text_splitter.get_cached_strategy('recursive')
-    text_splitter.set_strategy(ChunkingStrategyEnum.语义切分.value, max_chunk_size=32)
-    child_splitter = text_splitter.get_cached_strategy('semantic')
-
-    text_splitter.set_strategy(
-        ChunkingStrategyEnum.父子切分.value,
-        parent_splitter=parent_splitter, child_splitter=child_splitter,
-    )
-    print("\n【父子切分-依赖注入】")
-    chunks = text_splitter.split(parent_child_sample)
-    print(f"  共生成 {len(chunks)} 个子块（子块带 parent 引用与 parent_id）")
-    for i, chunk in enumerate(chunks):
-        parent = chunk.parent
-        print(f"  child{i}(id={chunk.metadata['chunk_id']}): {chunk.document!r}")
-        print(f"         parent_id={chunk.metadata.get('parent_id')}, "
-              f"所属父块: {parent.document!r}")
-
-    # 5.2 父/子均用递归切分（配置不同），需各自独立实例，不复用缓存
-    parent_splitter2 = SplitterFactory.create_strategy(ChunkingStrategyEnum.递归切分.value, chunk_size=60, overlap=20)
-    child_splitter2 = SplitterFactory.create_strategy(ChunkingStrategyEnum.递归切分.value, chunk_size=32, overlap=10)
-    text_splitter.set_strategy(
-        ChunkingStrategyEnum.父子切分.value,
-        parent_splitter=parent_splitter2, child_splitter=child_splitter2,
-    )
-    print("\n【父子切分-父子同名不同配置】")
-    print(f"  共生成 {len(chunks)} 个子块（子块带 parent 引用与 parent_id）")
-    for i, chunk in enumerate(chunks):
-        parent = chunk.parent
-        print(f"  child{i}(id={chunk.metadata['chunk_id']}): {chunk.document!r}")
-        print(f"         parent_id={chunk.metadata.get('parent_id')}, "
-              f"所属父块: {parent.document!r}")
+    #
+    # # 5. 父子切分：先切较大的父块，再对每个父块切较小的子块（依赖注入）
+    # parent_child_sample = (
+    #     "人工智能是计算机科学的一个分支，旨在让机器模拟人类智能。\n"
+    #     "机器学习通过大量数据训练模型，使计算机具备自动学习规律的能力。\n"
+    #     "深度学习利用多层神经网络进行特征提取，是机器学习的重要子领域。\n"
+    #     "大语言模型在海量文本上预训练，能够完成翻译、问答、摘要等生成任务。\n\n"
+    #     "火锅起源于川渝地区，以麻辣鲜香著称，是中国最具代表性的美食之一。\n"
+    #     "粤式早茶讲究精细，虾饺、烧卖、肠粉等都是经典茶点。\n"
+    #     "江浙菜口味偏甜，擅长清蒸与红烧，代表菜品有西湖醋鱼、东坡肉。\n\n"
+    #     "量子力学研究微观世界的运动规律，与相对论并称现代物理两大支柱。\n"
+    #     "薛定谔方程描述量子态演化，海森堡不确定性原理揭示了测量的极限。\n"
+    #     "量子纠缠等奇特现象正在推动量子计算与量子通信技术的发展。\n"
+    # )
+    #
+    # # 5.1 通过 get_cached_strategy 复用缓存中的切分器，或走工厂新建
+    # text_splitter.set_strategy(ChunkingStrategyEnum.递归切分.value, chunk_size=60, overlap=20)
+    # parent_splitter = text_splitter.get_cached_strategy('recursive')
+    # text_splitter.set_strategy(ChunkingStrategyEnum.语义切分.value, max_chunk_size=32)
+    # child_splitter = text_splitter.get_cached_strategy('semantic')
+    #
+    # text_splitter.set_strategy(
+    #     ChunkingStrategyEnum.父子切分.value,
+    #     parent_splitter=parent_splitter, child_splitter=child_splitter,
+    # )
+    # print("\n【父子切分-依赖注入】")
+    # chunks = text_splitter.split(parent_child_sample)
+    # print(f"  共生成 {len(chunks)} 个子块（子块带 parent 引用与 parent_id）")
+    # for i, chunk in enumerate(chunks):
+    #     parent = chunk.parent
+    #     print(f"  child{i}(id={chunk.metadata['chunk_id']}): {chunk.document!r}")
+    #     print(f"         parent_id={chunk.metadata.get('parent_id')}, "
+    #           f"所属父块: {parent.document!r}")
+    #
+    # # 5.2 父/子均用递归切分（配置不同），需各自独立实例，不复用缓存
+    # parent_splitter2 = SplitterFactory.create_strategy(ChunkingStrategyEnum.递归切分.value, chunk_size=60, overlap=20)
+    # child_splitter2 = SplitterFactory.create_strategy(ChunkingStrategyEnum.递归切分.value, chunk_size=32, overlap=10)
+    # text_splitter.set_strategy(
+    #     ChunkingStrategyEnum.父子切分.value,
+    #     parent_splitter=parent_splitter2, child_splitter=child_splitter2,
+    # )
+    # print("\n【父子切分-父子同名不同配置】")
+    # print(f"  共生成 {len(chunks)} 个子块（子块带 parent 引用与 parent_id）")
+    # for i, chunk in enumerate(chunks):
+    #     parent = chunk.parent
+    #     print(f"  child{i}(id={chunk.metadata['chunk_id']}): {chunk.document!r}")
+    #     print(f"         parent_id={chunk.metadata.get('parent_id')}, "
+    #           f"所属父块: {parent.document!r}")
