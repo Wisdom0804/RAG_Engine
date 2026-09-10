@@ -88,14 +88,13 @@ class RAGBase:
         return parents
 
     async def _store_parents_pg(self, parents: list[Chunk]) -> None:
-        """父块批量写入 PG parent_chunks 表"""
+        """父块批量写入 PG parent_chunk 表"""
         async with dbs.auto_commit() as session:
             for p in parents:
                 row = ParentChunk(
                     chunk_id=p.metadata['chunk_id'],
                     document=p.document,
                     metadata_=p.metadata,
-                    source_file=p.metadata.get('source_file'),
                 )
                 session.add(row)
 
@@ -132,8 +131,9 @@ class RAGBase:
             docs = ranked_docs
             metas = ranked_metas
 
-        # 父子反查 PG
-        parent_ids = [m.get('parent_id') for m in metas if m.get('parent_id') is not None]
+        # 父子反查 PG（chunk_id 为 bigint，parent_id 从 metadata 直取 int）
+        parent_ids = [m.get('parent_id') for m in metas
+                      if m.get('parent_id') is not None]
         if parent_ids:
             seen = set()
             uniq_pids = []

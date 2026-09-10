@@ -63,3 +63,6 @@ class Database:
                 await session.close()
 
 dbs = Database(secure.POSTGRE_DATABASE_URL)
+
+if __name__ == '__main__':
+    dbs.Base.metadata.create_all(dbs.engine)
