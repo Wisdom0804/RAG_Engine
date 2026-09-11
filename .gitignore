@@ -7,8 +7,19 @@ __pycache__/
 *.so
 
 # Distribution / packaging
+.agents
 .idea
 docs
+!/docs/
+/docs/*
+!/docs/agents/
+!/docs/plans/
+/docs/plans/*
+!/docs/plans/2026-09-11-fastapi-skeleton.md
+!/docs/plans/2026-09-11-fastapi-skeleton-implementation.md
+!/docs/adr/
+/docs/adr/*
+!/docs/adr/0001-model-lifecycle-and-shared-hub.md
 .Python
 build/
 develop-eggs/
