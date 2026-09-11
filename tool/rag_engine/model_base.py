@@ -13,12 +13,8 @@ import asyncio
 
 import dashscope
 from http import HTTPStatus
-from sentence_transformers import CrossEncoder, SentenceTransformer
 
 from app.config.security import secure
-
-# 阿里 maas 入口（base_url 走 secure.QWEN_API_BASE 配置）
-dashscope.base_http_api_url = secure.QWEN_API_BASE
 
 # qwen text-embedding 单次最多 20 条
 _QWEN_EMBED_BATCH = 20
@@ -30,37 +26,56 @@ class ModelHub:
     """
     模型接入中心：统一管理嵌入与重排模型，本地/API 双轨可切。
 
-    - 嵌入模型名取 secure.EMBEDDING_NAME，命中 qwen 前缀走 API，否则本地 SentenceTransformer
-    - 重排模型名取 secure.RERANK_NAME，命中 qwen 前缀走 API，否则本地 CrossEncoder
-    - embed_fn 属性供 SemanticChunking 注入复用同一 bge 实例（本地模式返回实例；API 模式返回 None，
-      由 SemanticChunking 回退到其默认本地模型 BAAI/bge-small-zh-v1.5）
+    - 模式分别取 secure.EMBEDDING_MODE / RERANK_MODE，不按模型名前缀推断。
+    - 本地模型由外部生命周期加载后挂载，本类不构造模型。
+    - embed_fn 本地模式返回共享实例，API 模式返回 None；语义切分不隐式兜底。
     """
 
-    # 阿里模型名标识（命中则走 API）
-    _QWEN_MARK = 'qwen'
+    def __init__(self) -> None:
+        self.unload()
 
-    def __init__(self):
+    def unload(self) -> None:
+        """释放模型引用，保留单例对象身份。"""
+        self.ready = False
         self._embedder = None
         self._reranker = None
-        self._init_embedder()
-        self._init_reranker()
+        self._embed_mode = None
+        self._rerank_mode = None
+        self._embed_model_name = None
+        self._rerank_model_name = None
+
+    def mount(self, *, embedder=None, reranker=None) -> None:
+        """验证完成后一次挂载已加载实例，失败不留下半就绪状态。"""
+        if self.ready:
+            raise RuntimeError('ModelHub 已挂载模型')
+        secure.validate_models()
+        if secure.EMBEDDING_MODE == 'local' and not callable(getattr(embedder, 'encode', None)):
+            raise ValueError('本地嵌入模式需要已加载的 embedder')
+        if secure.RERANK_MODE == 'local' and not callable(getattr(reranker, 'predict', None)):
+            raise ValueError('本地重排模式需要已加载的 reranker')
+        self._embed_mode = secure.EMBEDDING_MODE
+        self._rerank_mode = secure.RERANK_MODE
+        self._embedder = embedder if self._embed_mode == 'local' else None
+        self._reranker = reranker if self._rerank_mode == 'local' else None
+        self._embed_model_name = (secure.LOCAL_EMBEDDING_NAME if self._embed_mode == 'local'
+                                  else secure.QWEN_EMBEDDING_NAME)
+        self._rerank_model_name = (secure.LOCAL_RERANK_NAME if self._rerank_mode == 'local'
+                                   else secure.QWEN_RERANK_NAME)
+        if 'api' in (self._embed_mode, self._rerank_mode):
+            dashscope.base_http_api_url = secure.QWEN_API_BASE
+        self.ready = True
+
+    def require_ready(self) -> None:
+        if not self.ready:
+            raise RuntimeError('ModelHub 未就绪，请先通过生命周期加载并挂载模型')
 
     # ---------- 嵌入 ----------
-    def _init_embedder(self):
-        name = secure.QWEN_EMBEDDING_NAME or ''
-        if name.lower().startswith(self._QWEN_MARK):
-            self._embed_mode = 'api'
-            self._embed_model_name = name
-        else:
-            self._embed_mode = 'local'
-            self._embedder = SentenceTransformer(name)
-            self._embed_model_name = name
-
     async def embed(self, texts: list[str]) -> list[list[float]]:
         """
         批量编码文本为向量。
         本地走同步 encode 包 to_thread；API 走 dashscope，按 batch<=20 分批。
         """
+        self.require_ready()
         if self._embed_mode == 'local':
             vecs = await asyncio.to_thread(self._embedder.encode, texts)
             return vecs.tolist()
@@ -89,6 +104,7 @@ class ModelHub:
 
     async def embed_query(self, text: str) -> list[list[float]]:
         """检索 query 编码，API 模式 text_type=query"""
+        self.require_ready()
         if self._embed_mode == 'local':
             vecs = await asyncio.to_thread(self._embedder.encode, [text])
             return vecs.tolist()
@@ -110,28 +126,19 @@ class ModelHub:
         """供 SemanticChunking.configure(embed_fn=...) 注入复用同一 bge 实例。
 
         - 本地模式：返回已加载的 SentenceTransformer 实例，复用避免重复加载
-        - API 模式：返回 None，由 SemanticChunking 使用其默认本地模型 BAAI/bge-small-zh-v1.5
-          （语义切分需本地同步 encode 句子相似度，无法用 qwen API 替代）
+        - API 模式：返回 None，语义切分需另行显式注入支持同步 encode 的实例。
         """
+        self.require_ready()
         if self._embed_mode != 'local':
             return None
         return self._embedder
 
     # ---------- 重排 ----------
-    def _init_reranker(self):
-        name = secure.QWEN_RERANK_NAME or ''
-        if name.lower().startswith(self._QWEN_MARK):
-            self._rerank_mode = 'api'
-            self._rerank_model_name = name
-        else:
-            self._rerank_mode = 'local'
-            self._reranker = CrossEncoder(name)
-            self._rerank_model_name = name
-
     async def rerank(self, query: str, docs: list[str], top_k: int) -> list[tuple[str, float]]:
         """
         重排，返回 (doc, score) 列表降序，截 top_k。
         """
+        self.require_ready()
         if self._rerank_mode == 'local':
             pairs = [(query, d) for d in docs]
             scores = await asyncio.to_thread(self._reranker.predict, pairs)

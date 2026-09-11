@@ -9,6 +9,9 @@ IDE: PyCharm
 
 Copyright (c) 2026 星际区块链（深圳）有限公司. All rights reserved.
 """
+import asyncio
+from threading import Lock
+
 from sqlalchemy import select
 
 from app.libs.enums import ChunkingStrategyEnum
@@ -18,6 +21,10 @@ from tool.rag_engine.chroma_base import ChromaBase
 from tool.rag_engine.model_base import model_hub
 from tool.rag_engine.parsing_base import document_parser
 from tool.rag_engine.splitter_base import Chunk, text_splitter
+
+
+# ponytail: 共享策略缓存串行切分；吞吐不足时再改为每次请求独立策略。
+_split_lock = Lock()
 
 
 class RAGBase:
@@ -45,13 +52,9 @@ class RAGBase:
         :param kwargs: 透传给切分器（parent_child 需传 parent_splitter / child_splitter）
         :return: 入库 chunk 数
         """
+        self.model.require_ready()
         text = await self.parser.parse(path)
-        # 语义切分注入 model_hub 复用同一 bge 实例，避免重复加载
-        if strategy_name.lower() == 'semantic':
-            self.splitter.set_strategy('semantic', embed_fn=self.model.embed_fn, **kwargs)
-        else:
-            self.splitter.set_strategy(strategy_name, **kwargs)
-        chunks = self.splitter.split(text)
+        chunks = await asyncio.to_thread(self._split, text, strategy_name, **kwargs)
 
         for c in chunks:
             c.metadata['source_file'] = str(path)
@@ -72,6 +75,15 @@ class RAGBase:
         metas = [c.metadata for c in child_chunks]
         await self.chroma.add(documents=docs, embeddings=embeddings, metadatas=metas, ids=ids)
         return len(child_chunks)
+
+    def _split(self, text: str, strategy_name: str, **kwargs) -> list[Chunk]:
+        # 配置与切分一起加锁，避免并发请求改变正在使用的缓存策略。
+        with _split_lock:
+            if strategy_name.lower() == 'semantic':
+                self.splitter.set_strategy('semantic', embed_fn=self.model.embed_fn, **kwargs)
+            else:
+                self.splitter.set_strategy(strategy_name, **kwargs)
+            return self.splitter.split(text)
 
     def _collect_parents(self, chunks: list[Chunk]) -> list[Chunk]:
         """从子块 .parent 引用去重收集父块（仅父子策略产生 parent）"""
@@ -167,7 +179,7 @@ if __name__ == '__main__':
     from root import ROOT_DIR
     from tool.rag_engine.splitter_base import SplitterFactory
 
-    async def main():
+    async def demo():
         doc_path = ROOT_DIR / 'docs' / 'file' / '郑智文.pdf'
         query = '郑智文的技术栈与项目经验'
 
@@ -192,7 +204,8 @@ if __name__ == '__main__':
         # 用独立 collection 避免与上面定长 chunk 混检
         rag_pc = RAGBase(collection_name='parent_child_test')
         parent = SplitterFactory.create_strategy(ChunkingStrategyEnum.结构切分.value, chunk_size=800, overlap=0)
-        child = SplitterFactory.create_strategy(ChunkingStrategyEnum.语义切分.value, chunk_size=200)
+        child = SplitterFactory.create_strategy(ChunkingStrategyEnum.语义切分.value,
+                                                embed_fn=model_hub.embed_fn, chunk_size=200)
         n2 = await rag_pc.ingest(str(doc_path), 'parent_child',
                                  parent_splitter=parent, child_splitter=child)
         print(f'[parent_child] 入库 {n2} 条子 chunk')
@@ -202,5 +215,12 @@ if __name__ == '__main__':
         print(f'[parent_child retrieve] 命中 {len(p_docs)} 条父块:')
         for i, d in enumerate(p_docs, 1):
             print(f'  {i}. {d[:80].replace(chr(10), " ")}...')
+
+    async def main():
+        from app.lifespan import lifespan
+
+        # 演示也显式管理模型，不依赖模块导入触发加载。
+        async with lifespan(None):
+            await demo()
 
     asyncio.run(main())
