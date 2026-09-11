@@ -9,7 +9,15 @@ IDE: PyCharm
 
 Copyright (c) 2026 星际区块链（深圳）有限公司. All rights reserved.
 """
-from enum import Enum
+from enum import Enum, IntEnum
+
+
+class ResponseCode(IntEnum):
+    SUCCESS = 0
+    BUSINESS_ERROR = 1000
+    VALIDATION_ERROR = 1001
+    HTTP_ERROR = 1002
+    INTERNAL_ERROR = 1003
 
 
 class ChunkingStrategyEnum(Enum):

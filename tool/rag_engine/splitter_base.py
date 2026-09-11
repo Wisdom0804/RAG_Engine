@@ -14,8 +14,10 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Optional
 import numpy as np
-from sentence_transformers import SentenceTransformer
 from tool.siem_tool.snow_flake import snow_flake
+
+
+_UNSET = object()
 
 
 @dataclass
@@ -139,19 +141,17 @@ class SemanticChunking(ChunkingStrategy):
     """
     语义切分策略
     不固定分块大小，通过嵌入函数计算相邻句子的相似度，相似度低于阈值时断开形成新分块
-    默认嵌入模型 BAAI/bge-small-zh-v1.5（中文小模型，约 95MB），自定义嵌入方法需重写 encode 方法
+    必须显式注入支持 encode 的嵌入实例，不隐式加载模型
     通过 max_chunk_size 限制最大分片大小，防止语义高度连贯时产生超大分片，超大分片按三层降级切分
     """
 
     def __init__(self, embed_fn=None, threshold: float = 0.51, chunk_size: int = 1000):
         """
         :param embed_fn: 嵌入函数/模型，需支持 encode(list[str]) -> ndarray，
-                         默认使用 SentenceTransformer("BAAI/bge-small-zh-v1.5")（中文小模型，约 95MB）
+                         必须由调用方显式注入已加载实例
         :param threshold: 相似度阈值，低于该值则断开，取值范围 [0, 1]
         :param chunk_size: 单个分块的最大字符长度，超过则按三层降级切分（语义二分 → 弱边界 → 定长兜底）
         """
-        if embed_fn is None:
-            embed_fn = SentenceTransformer("BAAI/bge-small-zh-v1.5")
         self.embed_fn = embed_fn
         self.threshold = threshold
         self.max_chunk_size = chunk_size
@@ -159,14 +159,15 @@ class SemanticChunking(ChunkingStrategy):
         self._protect_map: dict[str, str] = {}
         self._validate()
 
-    def configure(self, *, embed_fn=None, threshold: float = None, max_chunk_size: int = None) -> None:
+    def configure(self, *, embed_fn=_UNSET, threshold: float = None, max_chunk_size: int = None) -> None:
         """
         批量设置构造参数，未传入的不修改
         :param embed_fn: 嵌入函数/模型，需支持 encode(list[str]) -> ndarray
         :param threshold: 相似度阈值，低于该值则断开，取值范围 [0, 1]
         :param max_chunk_size: 单个分块的最大字符长度
         """
-        if embed_fn is not None:
+        if embed_fn is not _UNSET:
+            self._validate_embed_fn(embed_fn)
             self.embed_fn = embed_fn
         if threshold is not None:
             self.threshold = threshold
@@ -176,10 +177,16 @@ class SemanticChunking(ChunkingStrategy):
 
     def _validate(self) -> None:
         """原子校验 threshold 与 max_chunk_size 的取值范围"""
+        self._validate_embed_fn(self.embed_fn)
         if self.threshold < 0 or self.threshold > 1:
             raise ValueError("threshold 必须在 [0, 1] 范围内")
         if self.max_chunk_size <= 0:
             raise ValueError("max_chunk_size 必须大于 0")
+
+    @staticmethod
+    def _validate_embed_fn(embed_fn) -> None:
+        if not callable(getattr(embed_fn, 'encode', None)):
+            raise ValueError('语义切分需要显式注入支持 encode 的 embed_fn')
 
     # ---------- 句子切分：强边界 R1（标点优先 + 换行兜底 + 缩写/小数保护） ----------
 
@@ -307,6 +314,7 @@ class SemanticChunking(ChunkingStrategy):
         return result
 
     def split(self, text: str) -> list[Chunk]:
+        self._validate_embed_fn(self.embed_fn)
         if not text.strip():
             return []
         # 切分
@@ -855,6 +863,26 @@ class TextSplitter:
         if not name:
             return None
         return self._cache.get(name.lower())
+
+    def clear_cache(self) -> None:
+        """生命周期关闭时释放缓存及父子策略中的模型引用。"""
+        seen = set()
+
+        def release(strategy: ChunkingStrategy | None) -> None:
+            if strategy is None or id(strategy) in seen:
+                return
+            seen.add(id(strategy))
+            if isinstance(strategy, SemanticChunking):
+                strategy.embed_fn = None
+            elif isinstance(strategy, ParentChildChunking):
+                release(strategy.parent_splitter)
+                release(strategy.child_splitter)
+
+        release(self.strategy)
+        for strategy in self._cache.values():
+            release(strategy)
+        self._cache.clear()
+        self.strategy = None
 
     def split(self, text: str) -> list[Chunk]:
         """委托当前策略执行切分，返回 Chunk 列表"""

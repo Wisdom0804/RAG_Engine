@@ -9,6 +9,9 @@ IDE: PyCharm
 
 Copyright (c) 2026 星际区块链（深圳）有限公司. All rights reserved.
 """
+from typing import Literal, Self
+
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from root import ROOT_DIR
@@ -32,11 +35,28 @@ class Secure(BaseSettings):
     POSTGRE_DB: str
 
     # 阿里模型
-    QWEN_API_KEY:str
-    QWEN_API_BASE:str
-    QWEN_EMBEDDING_NAME:str
-    QWEN_RERANK_NAME:str
+    QWEN_API_KEY: str = ''
+    QWEN_API_BASE: str = ''
+    QWEN_EMBEDDING_NAME: str = ''
+    QWEN_RERANK_NAME: str = ''
 
+    # 本地模型
+    LOCAL_EMBEDDING_NAME: str = ''
+    LOCAL_RERANK_NAME: str = ''
+    EMBEDDING_MODE: Literal['local', 'api'] = 'local'
+    RERANK_MODE: Literal['local', 'api'] = 'local'
+
+    @model_validator(mode='after')
+    def validate_models(self) -> Self:
+        """仅校验启用模式需要的配置，不在错误信息中暴露配置值。"""
+        for kind in ('EMBEDDING', 'RERANK'):
+            mode = getattr(self, f'{kind}_MODE')
+            required = ([f'LOCAL_{kind}_NAME'] if mode == 'local' else
+                        [f'QWEN_{kind}_NAME', 'QWEN_API_KEY', 'QWEN_API_BASE'])
+            for name in required:
+                if not getattr(self, name).strip():
+                    raise ValueError(f'{kind}_MODE={mode} 要求 {name} 非空')
+        return self
 
     # 使用 Pydantic v2 的配置方式
     model_config = SettingsConfigDict(
