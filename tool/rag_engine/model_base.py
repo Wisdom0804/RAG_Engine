@@ -14,7 +14,6 @@ import asyncio
 import dashscope
 from http import HTTPStatus
 
-from app.config.security import secure
 
 # qwen text-embedding 单次最多 20 条
 _QWEN_EMBED_BATCH = 20
@@ -22,11 +21,15 @@ _QWEN_EMBED_BATCH = 20
 _QWEN_EMBED_DIMENSION = 1024
 
 
+class ModelNotReady(RuntimeError):
+    """模型尚未由生命周期挂载。"""
+
+
 class ModelHub:
     """
     模型接入中心：统一管理嵌入与重排模型，本地/API 双轨可切。
 
-    - 模式分别取 secure.EMBEDDING_MODE / RERANK_MODE，不按模型名前缀推断。
+    - 模式分别取 config.EMBEDDING_MODE / RERANK_MODE，不按模型名前缀推断。
     - 本地模型由外部生命周期加载后挂载，本类不构造模型。
     - embed_fn 本地模式返回共享实例，API 模式返回 None；语义切分不隐式兜底。
     """
@@ -37,6 +40,7 @@ class ModelHub:
     def unload(self) -> None:
         """释放模型引用，保留单例对象身份。"""
         self.ready = False
+        self._api_key = None
         self._embedder = None
         self._reranker = None
         self._embed_mode = None
@@ -44,30 +48,34 @@ class ModelHub:
         self._embed_model_name = None
         self._rerank_model_name = None
 
-    def mount(self, *, embedder=None, reranker=None) -> None:
+    def mount(self, config=None, *, embedder=None, reranker=None) -> None:
         """验证完成后一次挂载已加载实例，失败不留下半就绪状态。"""
+        if config is None:
+            from app.config.security import secure
+            config = secure
         if self.ready:
             raise RuntimeError('ModelHub 已挂载模型')
-        secure.validate_models()
-        if secure.EMBEDDING_MODE == 'local' and not callable(getattr(embedder, 'encode', None)):
+        config.validate_models()
+        if config.EMBEDDING_MODE == 'local' and not callable(getattr(embedder, 'encode', None)):
             raise ValueError('本地嵌入模式需要已加载的 embedder')
-        if secure.RERANK_MODE == 'local' and not callable(getattr(reranker, 'predict', None)):
+        if config.RERANK_MODE == 'local' and not callable(getattr(reranker, 'predict', None)):
             raise ValueError('本地重排模式需要已加载的 reranker')
-        self._embed_mode = secure.EMBEDDING_MODE
-        self._rerank_mode = secure.RERANK_MODE
+        self._api_key = config.QWEN_API_KEY
+        self._embed_mode = config.EMBEDDING_MODE
+        self._rerank_mode = config.RERANK_MODE
         self._embedder = embedder if self._embed_mode == 'local' else None
         self._reranker = reranker if self._rerank_mode == 'local' else None
-        self._embed_model_name = (secure.LOCAL_EMBEDDING_NAME if self._embed_mode == 'local'
-                                  else secure.QWEN_EMBEDDING_NAME)
-        self._rerank_model_name = (secure.LOCAL_RERANK_NAME if self._rerank_mode == 'local'
-                                   else secure.QWEN_RERANK_NAME)
+        self._embed_model_name = (config.LOCAL_EMBEDDING_NAME if self._embed_mode == 'local'
+                                  else config.QWEN_EMBEDDING_NAME)
+        self._rerank_model_name = (config.LOCAL_RERANK_NAME if self._rerank_mode == 'local'
+                                   else config.QWEN_RERANK_NAME)
         if 'api' in (self._embed_mode, self._rerank_mode):
-            dashscope.base_http_api_url = secure.QWEN_API_BASE
+            dashscope.base_http_api_url = config.QWEN_API_BASE
         self.ready = True
 
     def require_ready(self) -> None:
         if not self.ready:
-            raise RuntimeError('ModelHub 未就绪，请先通过生命周期加载并挂载模型')
+            raise ModelNotReady('ModelHub 未就绪，请先通过生命周期加载并挂载模型')
 
     # ---------- 嵌入 ----------
     async def embed(self, texts: list[str]) -> list[list[float]]:
@@ -88,7 +96,7 @@ class ModelHub:
             batch = texts[i:i + _QWEN_EMBED_BATCH]
             resp = await asyncio.to_thread(
                 dashscope.TextEmbedding.call,
-                api_key=secure.QWEN_API_KEY,
+                api_key=self._api_key,
                 model=self._embed_model_name,
                 input=batch,
                 dimension=_QWEN_EMBED_DIMENSION,
@@ -110,7 +118,7 @@ class ModelHub:
             return vecs.tolist()
         resp = await asyncio.to_thread(
             dashscope.TextEmbedding.call,
-            api_key=secure.QWEN_API_KEY,
+            api_key=self._api_key,
             model=self._embed_model_name,
             input=text,
             dimension=_QWEN_EMBED_DIMENSION,
@@ -123,7 +131,7 @@ class ModelHub:
 
     @property
     def embed_fn(self):
-        """供 SemanticChunking.configure(embed_fn=...) 注入复用同一 bge 实例。
+        """供 SemanticChunking(embed_fn=...) 注入复用同一 bge 实例。
 
         - 本地模式：返回已加载的 SentenceTransformer 实例，复用避免重复加载
         - API 模式：返回 None，语义切分需另行显式注入支持同步 encode 的实例。
@@ -134,23 +142,22 @@ class ModelHub:
         return self._embedder
 
     # ---------- 重排 ----------
-    async def rerank(self, query: str, docs: list[str], top_k: int) -> list[tuple[str, float]]:
+    async def rerank(self, query: str, docs: list[str], top_k: int) -> list[tuple[int, float]]:
         """
-        重排，返回 (doc, score) 列表降序，截 top_k。
+        重排，返回 (原候选索引, score) 列表降序，截 top_k。
         """
         self.require_ready()
         if self._rerank_mode == 'local':
             pairs = [(query, d) for d in docs]
             scores = await asyncio.to_thread(self._reranker.predict, pairs)
-            ranked = sorted(zip(docs, scores), key=lambda x: x[1], reverse=True)
-            return ranked[:top_k]
+            return sorted(enumerate(scores), key=lambda x: x[1], reverse=True)[:top_k]
         return await self._rerank_api(query, docs, top_k)
 
-    async def _rerank_api(self, query: str, docs: list[str], top_k: int) -> list[tuple[str, float]]:
+    async def _rerank_api(self, query: str, docs: list[str], top_k: int) -> list[tuple[int, float]]:
         """阿里 qwen3.7-text-rerank"""
         resp = await asyncio.to_thread(
             dashscope.TextReRank.call,
-            api_key=secure.QWEN_API_KEY,
+            api_key=self._api_key,
             model=self._rerank_model_name,
             query=query,
             documents=docs,
@@ -160,10 +167,12 @@ class ModelHub:
         if resp.status_code != HTTPStatus.OK:
             raise RuntimeError(f"qwen rerank 调用失败: {resp}")
         # output.results 按 relevance_score 降序，每项含 index（对应输入 docs 下标）
-        ranked: list[tuple[str, float]] = []
+        ranked: list[tuple[int, float]] = []
         for item in resp["output"]["results"]:
             idx = item["index"]
-            ranked.append((docs[idx], float(item["relevance_score"])))
+            if type(idx) is not int or not 0 <= idx < len(docs):
+                raise RuntimeError(f"qwen rerank 返回无效候选索引: {idx}")
+            ranked.append((idx, float(item["relevance_score"])))
         return ranked[:top_k]
 
 

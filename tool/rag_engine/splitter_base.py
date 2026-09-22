@@ -14,10 +14,10 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Optional
 import numpy as np
-from tool.siem_tool.snow_flake import snow_flake
+from collections.abc import Callable
 
 
-_UNSET = object()
+
 
 
 @dataclass
@@ -26,17 +26,15 @@ class Chunk:
     切分结果统一数据结构
     - document: chunk 文本
     - metadata: 自定义元数据（chunk_id / parent_id / path 等）
-    - embedding: 嵌入向量，由下游嵌入步骤填充，split 阶段为 None
     - parent: 所属父块 Chunk（内存对象引用，非重复存储）；顶层块为 None
     """
     document: str
     metadata: dict = field(default_factory=dict)
-    embedding: Optional[list[float]] = None
     parent: Optional['Chunk'] = None
 
 
 class ChunkingStrategy(ABC):
-    """分块策略抽象基类，所有具体切分策略均需实现 split 与 configure 方法"""
+    """分块策略抽象基类，所有具体切分策略均需实现 split 方法"""
 
     @abstractmethod
     def split(self, text: str) -> list[Chunk]:
@@ -47,18 +45,13 @@ class ChunkingStrategy(ABC):
         """
         pass
 
-    @abstractmethod
-    def configure(self, **kwargs) -> None:
-        """
-        批量设置 __init__ 中的构造参数，未传入的参数保持原值不变
-        :param kwargs: 与各策略 __init__ 同名的可选参数
-        """
-        pass
 
-    @staticmethod
-    def _new_chunk(document: str, **metadata) -> Chunk:
+    def __init__(self, next_id: Callable[[], int]):
+        self.next_id = next_id
+
+    def _new_chunk(self, document: str, **metadata) -> Chunk:
         """统一 Chunk 构造点：自动填充雪花 ID 作为 chunk_id"""
-        metadata['chunk_id'] = snow_flake.next_id()
+        metadata['chunk_id'] = self.next_id()
         return Chunk(document=document, metadata=metadata)
 
     @staticmethod
@@ -92,11 +85,12 @@ class FixedLengthChunking(ChunkingStrategy):
     overlap 取自前一分块尾部，从 chunk_size 内部扣除，保证每个分块长度不超过 chunk_size
     """
 
-    def __init__(self, chunk_size: int = 200, overlap: int = 0):
+    def __init__(self, chunk_size: int = 200, overlap: int = 0, *, next_id: Callable[[], int]):
         """
         :param chunk_size: 每个分块的最大字符长度
         :param overlap: 相邻分块间的重叠字符长度，默认 0 表示不重叠
         """
+        super().__init__(next_id)
         self.chunk_size = chunk_size
         self.overlap = overlap
         self._validate()
@@ -108,17 +102,6 @@ class FixedLengthChunking(ChunkingStrategy):
         if self.chunk_size <= self.overlap:
             raise ValueError(f"overlap 必须在[0,{self.chunk_size})之间")
 
-    def configure(self, *, chunk_size: int = None, overlap: int = None) -> None:
-        """
-        批量设置构造参数，未传入的不修改
-        :param chunk_size: 每个分块的最大字符长度
-        :param overlap: 重叠字符长度
-        """
-        if chunk_size is not None:
-            self.chunk_size = chunk_size
-        if overlap is not None:
-            self.overlap = overlap
-        self._validate()
 
     def split(self, text: str) -> list[Chunk]:
         if not text:
@@ -145,13 +128,14 @@ class SemanticChunking(ChunkingStrategy):
     通过 max_chunk_size 限制最大分片大小，防止语义高度连贯时产生超大分片，超大分片按三层降级切分
     """
 
-    def __init__(self, embed_fn=None, threshold: float = 0.51, chunk_size: int = 1000):
+    def __init__(self, embed_fn=None, threshold: float = 0.51, chunk_size: int = 1000, *, next_id: Callable[[], int]):
         """
         :param embed_fn: 嵌入函数/模型，需支持 encode(list[str]) -> ndarray，
                          必须由调用方显式注入已加载实例
         :param threshold: 相似度阈值，低于该值则断开，取值范围 [0, 1]
         :param chunk_size: 单个分块的最大字符长度，超过则按三层降级切分（语义二分 → 弱边界 → 定长兜底）
         """
+        super().__init__(next_id)
         self.embed_fn = embed_fn
         self.threshold = threshold
         self.max_chunk_size = chunk_size
@@ -159,21 +143,6 @@ class SemanticChunking(ChunkingStrategy):
         self._protect_map: dict[str, str] = {}
         self._validate()
 
-    def configure(self, *, embed_fn=_UNSET, threshold: float = None, max_chunk_size: int = None) -> None:
-        """
-        批量设置构造参数，未传入的不修改
-        :param embed_fn: 嵌入函数/模型，需支持 encode(list[str]) -> ndarray
-        :param threshold: 相似度阈值，低于该值则断开，取值范围 [0, 1]
-        :param max_chunk_size: 单个分块的最大字符长度
-        """
-        if embed_fn is not _UNSET:
-            self._validate_embed_fn(embed_fn)
-            self.embed_fn = embed_fn
-        if threshold is not None:
-            self.threshold = threshold
-        if max_chunk_size is not None:
-            self.max_chunk_size = max_chunk_size
-        self._validate()
 
     def _validate(self) -> None:
         """原子校验 threshold 与 max_chunk_size 的取值范围"""
@@ -371,12 +340,13 @@ class RecursiveChunking(ChunkingStrategy):
         None,                         # 定长兜底
     ]
 
-    def __init__(self, chunk_size: int = 500, overlap: int = 50, separators: list = None):
+    def __init__(self, chunk_size: int = 500, overlap: int = 50, separators: list = None, *, next_id: Callable[[], int]):
         """
         :param chunk_size: 每个分块的目标/最大字符长度
         :param overlap: 相邻分块间的重叠字符长度
         :param separators: 自定义分隔符序列，粒度由粗到细，最后一项为 None 时表示定长兜底
         """
+        super().__init__(next_id)
         self.chunk_size = chunk_size
         self.overlap = overlap
         self.separators = separators if separators is not None else list(self.DEFAULT_SEPARATORS)
@@ -389,20 +359,6 @@ class RecursiveChunking(ChunkingStrategy):
         if self.overlap < 0 or self.overlap >= self.chunk_size:
             raise ValueError(f"overlap 必须在 [0, {self.chunk_size}) 之间")
 
-    def configure(self, chunk_size: int = None, overlap: int = None, separators: list = None) -> None:
-        """
-        批量设置构造参数，未传入的不修改
-        :param chunk_size: 每个分块的目标/最大字符长度
-        :param overlap: 相邻分块间的重叠字符长度
-        :param separators: 自定义分隔符序列
-        """
-        if chunk_size is not None:
-            self.chunk_size = chunk_size
-        if overlap is not None:
-            self.overlap = overlap
-        if separators is not None:
-            self.separators = separators
-        self._validate()
 
     def _split_by_separator(self, text: str, separator) -> list[str]:
         """按单个分隔符切分文本，保留分隔产生的非空片段"""
@@ -492,11 +448,12 @@ class StructuralChunking(ChunkingStrategy):
         None,                                      # 定长兜底
     ]
 
-    def __init__(self, chunk_size: int = 500, overlap: int = 50):
+    def __init__(self, chunk_size: int = 500, overlap: int = 50, *, next_id: Callable[[], int]):
         """
         :param chunk_size: 每个分块的目标/最大字符长度
         :param overlap: 相邻分块间的重叠字符长度
         """
+        super().__init__(next_id)
         self.chunk_size = chunk_size
         self.overlap = overlap
         self.separators = list(self.STRUCTURAL_SEPARATORS)
@@ -509,17 +466,6 @@ class StructuralChunking(ChunkingStrategy):
         if self.overlap < 0 or self.overlap >= self.chunk_size:
             raise ValueError(f"overlap 必须在 [0, {self.chunk_size}) 之间")
 
-    def configure(self, *, chunk_size: int = None, overlap: int = None) -> None:
-        """
-        批量设置构造参数，未传入的不修改
-        :param chunk_size: 每个分块的目标/最大字符长度
-        :param overlap: 相邻分块间的重叠字符长度
-        """
-        if chunk_size is not None:
-            self.chunk_size = chunk_size
-        if overlap is not None:
-            self.overlap = overlap
-        self._validate()
 
     # ---------- markdown 结构单元识别 ----------
 
@@ -748,17 +694,6 @@ class ParentChildChunking(ChunkingStrategy):
         self.parent_splitter = parent_splitter
         self.child_splitter = child_splitter
 
-    def configure(self, parent_splitter: ChunkingStrategy = None,
-                  child_splitter: ChunkingStrategy = None) -> None:
-        """
-        批量替换切分器实例，未传入的保持原值
-        :param parent_splitter: 新的父块切分器实例
-        :param child_splitter: 新的子块切分器实例
-        """
-        if parent_splitter is not None:
-            self.parent_splitter = parent_splitter
-        if child_splitter is not None:
-            self.child_splitter = child_splitter
 
     def split(self, text: str) -> list[Chunk]:
         """
@@ -808,85 +743,8 @@ class SplitterFactory:
             raise ValueError(f"未知的分块策略 '{name}'")
         return cls._registry[key](**kwargs)
 
-    @classmethod
-    def available(cls) -> list[str]:
-        """返回已注册的所有策略名"""
-        return list(cls._registry.keys())
 
 
-class TextSplitter:
-    """
-    分块上下文类（Strategy 模式的 Context）
-    持有一个 ChunkingStrategy 实例并委托其完成切分，支持运行时切换策略
-    内部缓存已使用过的策略实例（按 name 索引），切换时优先复用，避免重复构造
-    （如 SemanticChunking 的嵌入模型重复加载）
-    """
-
-    def __init__(self, name: str = None, **kwargs):
-        """
-        通过策略名 + 参数构造，等价于首次 set_strategy
-        :param name: 策略名，如 "fixed_length"、"semantic"
-        :param kwargs: 透传给策略构造函数的参数
-        """
-        self._cache: dict[str, ChunkingStrategy] = {}
-        # 当前策略
-        self.strategy = None
-        self.set_strategy(name, **kwargs)
-
-    def set_strategy(self, name: str = None, **kwargs) -> None:
-        """
-        切换或初始化分块策略
-        缓存命中则复用已有策略实例（并按 kwargs 原地 configure），
-        未命中则通过工厂创建并缓存
-        :param name: 策略名（不区分大小写）
-        :param kwargs: 命中时调用 configure 原地更新；未命中时透传给构造函数
-        """
-        if name is None:
-            return None
-        key = name.lower()
-        if key in self._cache:
-            self.strategy = self._cache[key]
-            if kwargs:
-                self.strategy.configure(**kwargs)
-            return None
-        else:
-            self.strategy = SplitterFactory.create_strategy(name, **kwargs)
-            self._cache[key] = self.strategy
-            return None
-
-    def get_cached_strategy(self, name: str) -> Optional[ChunkingStrategy]:
-        """
-        从缓存取已构造的策略实例，未命中返回 None。
-        调用方自负其责：父子同名策略且配置不同时，不要从缓存取，
-        应直接通过 SplitterFactory.create_strategy 另建独立实例。
-        """
-        if not name:
-            return None
-        return self._cache.get(name.lower())
-
-    def clear_cache(self) -> None:
-        """生命周期关闭时释放缓存及父子策略中的模型引用。"""
-        seen = set()
-
-        def release(strategy: ChunkingStrategy | None) -> None:
-            if strategy is None or id(strategy) in seen:
-                return
-            seen.add(id(strategy))
-            if isinstance(strategy, SemanticChunking):
-                strategy.embed_fn = None
-            elif isinstance(strategy, ParentChildChunking):
-                release(strategy.parent_splitter)
-                release(strategy.child_splitter)
-
-        release(self.strategy)
-        for strategy in self._cache.values():
-            release(strategy)
-        self._cache.clear()
-        self.strategy = None
-
-    def split(self, text: str) -> list[Chunk]:
-        """委托当前策略执行切分，返回 Chunk 列表"""
-        return self.strategy.split(text)
 
 
-text_splitter = TextSplitter()
+

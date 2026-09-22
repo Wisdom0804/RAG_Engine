@@ -48,12 +48,12 @@ class DocumentParser:
         return result.markdown
 
 
-# 模块级单例
-document_parser = DocumentParser()
+
 
 
 if __name__ == '__main__':
     async def main():
+        document_parser = DocumentParser()
         # 演示：解析本文件自身（.py 不在白名单，演示白名单拦截）
         try:
             await document_parser.parse(__file__)

@@ -18,8 +18,6 @@ from root import ROOT_DIR
 
 
 class Secure(BaseSettings):
-    # 环境(CONSOLE:正式，DEV：测试)
-    ENVIRONMENT: str
     # 服务配置信息
     APP_PORT: int
     APP_HOST: str
@@ -27,12 +25,7 @@ class Secure(BaseSettings):
     MACHINE_ID: int
 
     # PostgreSQL连接配置
-    POSTGRE_DATABASE_URL: str
-    POSTGRE_HOST: str
-    POSTGRE_PORT: str
-    POSTGRE_USER: str
-    POSTGRE_PASSWORD: str
-    POSTGRE_DB: str
+    POSTGRE_DATABASE_URL: str | None = None
 
     # 阿里模型
     QWEN_API_KEY: str = ''
@@ -49,6 +42,8 @@ class Secure(BaseSettings):
     @model_validator(mode='after')
     def validate_models(self) -> Self:
         """仅校验启用模式需要的配置，不在错误信息中暴露配置值。"""
+        if self.POSTGRE_DATABASE_URL is not None and not self.POSTGRE_DATABASE_URL.strip():
+            raise ValueError('POSTGRE_DATABASE_URL 提供时不能为空')
         for kind in ('EMBEDDING', 'RERANK'):
             mode = getattr(self, f'{kind}_MODE')
             required = ([f'LOCAL_{kind}_NAME'] if mode == 'local' else
@@ -64,6 +59,11 @@ class Secure(BaseSettings):
         env_file_encoding="utf-8",
         extra="ignore"  # 避免多余字段报错
     )
+
+
+secure = Secure()
+
+
 
 
 secure = Secure()

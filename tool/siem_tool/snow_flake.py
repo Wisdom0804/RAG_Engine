@@ -12,7 +12,6 @@ Copyright (c) 2026 星际区块链（深圳）有限公司. All rights reserved.
 import threading
 import time
 
-from app.config.security import secure
 
 
 class SnowFlake:
@@ -62,13 +61,13 @@ class SnowFlake:
     # 时钟回拨容忍阈值（毫秒），超过则判定为异常回拨
     CLOCK_BACKWARD_TOLERANCE = 5
 
-    def __init__(self, worker_id: int = secure.MACHINE_ID, data_center_id: int = 0):
+    def __init__(self, worker_id: int, data_center_id: int = 0):
         """
         初始化雪花 ID 生成器
 
         单例通过模块级实例 snow_flake 提供，直接构造仍可用作多实例场景。
 
-        :param worker_id: 机器ID，范围 [0, 31]，默认取 secure.MACHINE_ID
+        :param worker_id: 机器ID，范围 [0, 31]，由装配点提供
         :param data_center_id: 数据中心ID，范围 [0, 31]，默认 0
         """
         if worker_id < 0 or worker_id > self.MAX_WORKER_ID:
@@ -147,20 +146,14 @@ class SnowFlake:
                 | self._sequence
             )
 
-snow_flake = SnowFlake()
+
 
 
 if __name__ == '__main__':
-    # 模块级单例校验：重复导入得到同一实例
-    from snow_flake import snow_flake as sf_a
-    from snow_flake import snow_flake as sf_b
-    print(f"模块单例校验: {sf_a is sf_b is snow_flake}")
+    from app.config.security import Secure
+    secure = Secure()
 
-    # 批量生成 ID，校验唯一性与趋势递增
-    ids = [snow_flake.next_id() for _ in range(5)]
-    print("生成示例:")
-    for i, value in enumerate(ids):
-        print(f"  next_id[{i}]: {value}")
-    print(f"唯一性校验: {len(set(ids)) == len(ids)}")
-    print(f"趋势递增校验: {ids == sorted(ids)}")
-
+    generator = SnowFlake(worker_id=secure.MACHINE_ID)
+    ids = [generator.next_id() for _ in range(5000)]
+    assert len(set(ids)) == len(ids) and ids == sorted(ids)
+    print('雪花 ID 唯一性和顺序检查通过')

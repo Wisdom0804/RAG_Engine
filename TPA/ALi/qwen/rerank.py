@@ -13,7 +13,8 @@ Copyright (c) 2026 星际区块链（深圳）有限公司. All rights reserved.
 import dashscope
 from http import HTTPStatus
 
-from app.config.security import secure
+from app.config.security import Secure
+secure = Secure()
 
 # 以下为华北2（北京）地域的配置，调用时请将{WorkspaceId}替换为真实的业务空间ID，各地域的配置不同。
 dashscope.base_http_api_url = "https://llm-udh4a0m8ljmmeirn.cn-beijing.maas.aliyuncs.com/api/v1"

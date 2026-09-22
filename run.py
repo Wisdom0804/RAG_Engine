@@ -13,7 +13,8 @@ Copyright (c) 2026 星际区块链（深圳）有限公司. All rights reserved.
 if __name__ == "__main__":
     import uvicorn
 
-    from app.config.security import secure
+    from app.config.security import Secure
+    secure = Secure()
 
     uvicorn.run(
         "app:create_app",

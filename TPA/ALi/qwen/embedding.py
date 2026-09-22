@@ -12,7 +12,8 @@ Copyright (c) 2026 星际区块链（深圳）有限公司. All rights reserved.
 import dashscope
 from http import HTTPStatus
 
-from app.config.security import secure
+from app.config.security import Secure
+secure = Secure()
 from tool.rag_engine.chroma_base import ChromaBase
 
 # 以下为华北2（北京）地域的配置，调用时请将{WorkspaceId}替换为真实的业务空间ID，各地域的配置不同。
@@ -40,7 +41,8 @@ def test():
     """
     测试数据
     """
-    db = ChromaBase()
+    import chromadb
+    db = ChromaBase(chromadb.EphemeralClient())
     db.collection.add(
         ids=['id1', 'id2'],
         # 0.79   1.52  默认模型，嵌入方式

@@ -12,8 +12,12 @@ Copyright (c) 2026 星际区块链（深圳）有限公司. All rights reserved.
 import asyncio
 from uuid import uuid4
 
-from tool.rag_engine import chromadb_client
+from chromadb.api import ClientAPI
 from tool.rag_engine.Schemas.chroma_schemas import ChromaGetResponse, ChromaQueryResponse
+
+
+class CollectionConflict(ValueError):
+    """集合策略或文件内容与已有数据冲突。"""
 
 
 class ChromaBase:
@@ -24,8 +28,24 @@ class ChromaBase:
     嵌入向量由调用方外部计算后传入，本类不负责 embedding / rerank。
     """
 
-    def __init__(self, collection_name: str = 'learning'):
-        self.collection = chromadb_client.get_or_create_collection(name=collection_name)
+    def __init__(self, client: ClientAPI, collection_name: str = 'learning', *, create: bool = True):
+        self.client = client
+        self.collection = (self.client.get_or_create_collection(name=collection_name)
+                           if create else self.client.get_collection(name=collection_name))
+
+    async def check_strategy(self, strategy: str) -> None:
+        """只检查策略一致性；绑定必须在文件和模型就绪后执行。"""
+        current = (self.collection.metadata or {}).get('rag_strategy')
+        if current is not None and current != strategy:
+            raise CollectionConflict('集合已绑定其他切分策略')
+        if current is None and await asyncio.to_thread(self.collection.count):
+            raise CollectionConflict('已有集合缺少策略标记，请使用新集合')
+
+    async def bind_strategy(self, strategy: str) -> None:
+        """首次合法入库前持久绑定策略，保留其他集合元数据。"""
+        metadata = dict(self.collection.metadata or {})
+        if metadata.get('rag_strategy') is None:
+            await asyncio.to_thread(self.collection.modify, metadata={**metadata, 'rag_strategy': strategy})
 
     async def add(self, documents: list[str] | None = None,
                   embeddings: list[list[float]] | None = None,
@@ -54,7 +74,10 @@ class ChromaBase:
         if metadatas is not None:
             data["metadatas"] = metadatas
 
-        await asyncio.to_thread(self.collection.add, **data)
+        batch_size = await asyncio.to_thread(self.client.get_max_batch_size)
+        for start in range(0, count, batch_size):
+            batch = {key: values[start:start + batch_size] for key, values in data.items()}
+            await asyncio.to_thread(self.collection.add, **batch)
         return ids
 
     async def get(self, **filters) -> ChromaGetResponse:
@@ -120,13 +143,13 @@ class ChromaBase:
         await asyncio.to_thread(self.collection.delete, ids=ids)
 
 
-# 模块级单例
-chroma_base = ChromaBase()
+
 
 
 if __name__ == '__main__':
     async def main():
-        db = ChromaBase()
+        import chromadb
+        db = ChromaBase(chromadb.EphemeralClient())
         # Create
         ids = await db.add(documents=['Hello', '扣你吉瓦', 'ohhhhhhh'],
                            metadatas=[{'src': 'a'}, {'src': 'b'}, {'src': 'a'}])

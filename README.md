@@ -35,10 +35,10 @@ python run.py
 未启用模式的模型配置可为空。local 模型只在 lifespan 启动时通过工作线程加载，全部成功后挂载共享 `model_hub`；失败直接中止启动。关闭清理模型和全局切分缓存，允许重新启动；同进程不支持并行 APP 生命周期。释放引用不保证 GPU 分配器立即归还显存。
 
 ```powershell
-Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/test -ContentType 'application/json' -Body '{"text":"hello"}'
+Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/api/test -ContentType 'application/json' -Body '{"text":"hello"}'
 ```
 
-`POST /test` 接收 `TestRequest` 请求体（必填非空字符串 `text`），API 将数据传给 `TestService.process()`，由 Service 返回 `TestVO`，API 使用 `Success[TestVO]` 响应模型：
+`POST /api/test` 接收 `TestDTO` 请求体（必填非空字符串 `text`），API 将数据传给 `TestService.process()`，由 Service 返回 `TestVO`，API 使用 `Success[TestVO]` 响应模型：
 
 ```json
 {"code": 0, "message": "success", "data": {"text": "hello"}}
@@ -46,7 +46,7 @@ Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/test -ContentType 'app
 
 业务错误/校验错误/HTTP 错误/内部错误分别使用 code 1000/1001/1002/1003；HTTP 状态保留 400/422/原状态/500，错误 data 固定为 null。文档位于 `/docs` 和 `/openapi.json`。测试接口不调用 RAG、模型或数据库，但应用仍会在接收请求前初始化所选模型。
 
-模型业务调用方向为 API → Service → rag_base → model_hub。导入 ModelHub/RAGBase 不构造本地模型；CLI 演示显式复用 lifespan。语义切分必须注入支持同步 `encode` 的实例，API 嵌入模式下不会偷偷加载本地模型，应使用非语义策略或显式提供语义切分模型。Chroma 仍为进程内临时存储。
+模型业务调用方向为 API → Service → rag_base → model_hub。导入 ModelHub/RAGBase 不构造本地模型；CLI 演示显式复用 lifespan。语义切分必须注入支持同步 `encode` 的实例，API 嵌入模式下不会偷偷加载本地模型，应使用非语义策略或显式提供语义切分模型。Chroma 使用本地持久化存储，目录为 `docs/vector/chromadb`。
 
 ```powershell
 python -m compileall -q app tool TPA root.py run.py
@@ -56,3 +56,34 @@ python -m unittest discover -s tests
 第一条仅检查语法；第二条验证响应、配置、生命周期、调用链与分块行为，不下载模型、不连接数据库、不调用付费 API。真实模型启动和 RAG 演示需要另行准备模型、样本与数据库。
 
 设计与实施记录见 [设计方案](docs/plans/2026-09-11-fastapi-skeleton.md) 和 [实施方案](docs/plans/2026-09-11-fastapi-skeleton-implementation.md)。
+
+
+## RAG API
+
+新增依赖（已有环境中安装）：
+
+```powershell
+python -m pip install python-multipart "markitdown[all]" sqlalchemy asyncpg
+```
+
+提供两个接口，不包含 LLM 生成：
+
+| 接口 | 请求 | 响应 data |
+|---|---|---|
+| `POST /api/rag/documents` | multipart 文件与切分参数 | collection_name、file_name、chunk_count |
+| `POST /api/rag/retrieve` | JSON 查询与检索配置 | collection_name、query、contexts、count |
+
+```powershell
+curl.exe -X POST http://127.0.0.1:8000/api/rag/documents -F "file=@guide.pdf" -F "collection_name=manuals" -F "strategy=recursive" -F "chunk_size=500" -F "overlap=50"
+Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/api/rag/retrieve -ContentType 'application/json' -Body '{"collection_name":"manuals","query":"安装步骤","top_k":5,"rerank":false}'
+```
+
+单文件上限 20 MiB。集合默认 `learning`，名字为 3–63 个字母、数字、下划线、短横线，首尾为字母或数字。每集合固定一种策略；支持 fixed_length、semantic、recursive、structural、parent_child。父子模式默认结构父块 800 字符、递归子块 200 字符，可用 parent_chunk_size 和 chunk_size 调整。semantic 需要本地嵌入模型，不接受 overlap。
+
+同集合内内容相同的文件返回 409，改名不能绕过；同名不同内容视为新增。不同集合可保存相同文件。检索可用 where 按 source_file 等元数据过滤；无命中返回空列表，父块去重后 count 可能少于 top_k。
+
+Chroma 向量、文件指纹和集合策略一起持久化。父子模式还需 PostgreSQL 的 `rag_engine.parent_chunk` 表，ORM 定义见 `app/model/parent_chunk.py`。沿用单 worker；多个服务进程不得同时写同一向量目录。同集合正在入库时其他上传返回 409。请求取消可能在服务端完成入库，重试遇到重复冲突代表文件已存在。
+
+存储异常会尝试补偿删除本次向量和父块，但不承诺跨数据库事务、崩溃恢复或入库期间的检索快照隔离。保持模型及其维度与已有集合一致；更换嵌入模型后应使用新集合重新入库。
+
+完整字段、默认值与失败语义见 [RAG API 设计](docs/plans/2026-09-11-rag-api-design.md)，持久化决策见 [ADR 0002](docs/adr/0002-persistent-rag-collections.md)。

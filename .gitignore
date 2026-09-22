@@ -233,3 +233,19 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# RAG API 的契约、决策与回归测试；样本文档和向量数据继续忽略。
+!/README.md
+!/CONTEXT.md
+!/docs/adr/0001-model-lifecycle-and-shared-hub.md
+!/docs/adr/0002-persistent-rag-collections.md
+!/docs/plans/2026-09-11-rag-api-design.md
+!/tests/
+/tests/*
+!/tests/test_api.py
+!/tests/test_model_lifecycle.py
+!/tests/test_semantic_lifecycle.py
+!/tests/test_splitter_newlines.py
+!/tests/test_rag_api.py
+!/tests/test_rag_flow.py
+!/docs/plans/2026-09-11-design-simplification-audit.md
