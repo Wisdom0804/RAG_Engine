@@ -9,6 +9,8 @@ __pycache__/
 # Distribution / packaging
 .agents
 .idea
+*.md
+test_*
 docs
 !/docs/
 /docs/*
