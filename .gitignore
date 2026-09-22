@@ -11,6 +11,7 @@ __pycache__/
 .idea
 *.md
 test_*
+*.json
 docs
 !/docs/
 /docs/*
